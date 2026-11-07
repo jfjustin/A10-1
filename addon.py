@@ -1,54 +1,91 @@
-"""mitmproxy addon: policy enforcement + event log + kill switch.
-Run:  mitmdump -p 8080 -s addon.py
+"""mitmproxy addon: sends every request the agent makes to the gateway for a verdict.
+
+    mitmdump -p 8080 -s addon.py          # first run creates ~/.mitmproxy/mitmproxy-ca-cert.pem
+
+The gateway decides (G3 secrets in bodies, G4 internal addresses, allowlist,
+mode table, approvals). If the gateway can't be reached, the request is blocked
+(block_on_failure). Secret headers never leave this process.
 """
-import json, time, os
-from mitmproxy import http
+from __future__ import annotations
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-EVENTS = os.path.join(HERE, "state", "events.jsonl")
-STOP = os.path.join(HERE, "state", "STOP")      # exists => session stopped, block everything
-POLICY = os.path.join(HERE, "policy.json")
+import asyncio
+import json
+import os
+import sys
+import urllib.request
 
-def policy():
-    with open(POLICY) as f:       # re-read each time: edit rules live during the demo
-        return json.load(f)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def log(verdict, host, detail, method=""):
-    ev = {"ts": time.strftime("%H:%M:%S"), "verdict": verdict, "host": host, "method": method, "detail": detail}
-    with open(EVENTS, "a") as f:
-        f.write(json.dumps(ev) + "\n")
+from mitmproxy import ctx, http  # noqa: E402
 
-def host_allowed(host, p):
-    if p["mode"] != "allowlist":
-        return True
-    return any(host == d or host.endswith("." + d) for d in p["allowed_domains"])
+from harness.config import load_policy  # noqa: E402
 
-def deny(flow, reason):
-    flow.response = http.Response.make(403, f"Blocked by Agent Harness: {reason}", {"Content-Type": "text/plain"})
+POLICY = load_policy()
+BODY_LIMIT = 256 * 1024
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # never proxy ourselves
+
+
+def _token() -> str:
+    try:
+        return POLICY.token_path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def ask_gateway(host: str, port: int, method: str, path: str, body: str) -> tuple[bool, str]:
+    req = urllib.request.Request(
+        POLICY.gateway_url + "/check/network",
+        data=json.dumps({"host": host, "port": port, "method": method, "path": path, "body": body}).encode(),
+        headers={"Content-Type": "application/json", "X-Operator-Token": _token()},
+        method="POST")
+    try:
+        with _opener.open(req, timeout=POLICY.approval_timeout_seconds + 15) as resp:
+            v = json.loads(resp.read())
+            return bool(v.get("allow")), v.get("message", "")
+    except Exception as exc:
+        if POLICY.block_on_failure:
+            return False, f"Blocked by Agent Harness: gateway unreachable ({exc.__class__.__name__})"
+        return True, "gateway unreachable, allowed (block_on_failure is off)"
+
+
+def _is_hook_call(flow: http.HTTPFlow) -> bool:
+    """oh's own pre_tool_use hook goes through the proxy too (it honors HTTP_PROXY)."""
+    r = flow.request
+    return (r.host in (POLICY.gateway_host, "localhost", "127.0.0.1") and r.port == POLICY.gateway_port
+            and r.path.split("?")[0] == "/hook" and r.method == "POST")
+
+
+def _deny(flow: http.HTTPFlow, message: str):
+    flow.response = http.Response.make(403, message, {"Content-Type": "text/plain"})
+
 
 class Harness:
-    # HTTPS: decided at CONNECT time from the hostname, no TLS interception needed
-    def http_connect(self, flow: http.HTTPFlow):
-        host = flow.request.pretty_host
-        if os.path.exists(STOP):
-            deny(flow, "session stopped"); log("BLOCKED", host, "session stopped", "CONNECT"); return
-        if not host_allowed(host, policy()):
-            deny(flow, "domain not allowed"); log("BLOCKED", host, "domain not on allowlist", "CONNECT"); return
-        log("ALLOWED", host, "tunnel opened", "CONNECT")
+    def load(self, loader):
+        POLICY.state_dir.mkdir(parents=True, exist_ok=True)
+        (POLICY.state_dir / "proxy.pid").write_text(str(os.getpid()))
 
-    # Decrypted / plain HTTP: also inspect the body for dangerous patterns
-    def request(self, flow: http.HTTPFlow):
+    async def http_connect(self, flow: http.HTTPFlow):
+        # HTTPS tunnels: the decrypted requests are judged in request(); only refuse
+        # tunnels to internal addresses early so nothing reaches them.
+        if flow.request.port == POLICY.gateway_port and flow.request.host in ("127.0.0.1", "localhost"):
+            _deny(flow, "Blocked by Agent Harness [G4]: the gateway is not reachable from the agent")
+            return
+        ok, msg = await asyncio.to_thread(ask_gateway, flow.request.pretty_host, flow.request.port,
+                                          "CONNECT", "", "")
+        if not ok:
+            _deny(flow, msg)
+
+    async def request(self, flow: http.HTTPFlow):
         if flow.request.method == "CONNECT":
             return
-        host, p = flow.request.pretty_host, policy()
-        if os.path.exists(STOP):
-            deny(flow, "session stopped"); log("BLOCKED", host, "session stopped", flow.request.method); return
-        if not host_allowed(host, p):
-            deny(flow, "domain not allowed"); log("BLOCKED", host, "domain not on allowlist", flow.request.method); return
-        text = flow.request.get_text(strict=False) or ""
-        for pat in p["blocked_patterns"]:
-            if pat in text or pat in flow.request.pretty_url:
-                deny(flow, f"matched rule '{pat}'"); log("BLOCKED", host, f"matched rule '{pat}'", flow.request.method); return
-        log("ALLOWED", host, flow.request.path[:80], flow.request.method)
+        if _is_hook_call(flow):
+            return
+        r = flow.request
+        body = (r.get_text(strict=False) or "")[:BODY_LIMIT] if r.raw_content else ""
+        ok, msg = await asyncio.to_thread(ask_gateway, r.pretty_host, r.port, r.method, r.path, body)
+        if not ok:
+            _deny(flow, msg)
+            ctx.log.info(msg)
+
 
 addons = [Harness()]

@@ -1,5 +1,36 @@
 {
-  "mode": "allowlist",
-  "allowed_domains": ["api.anthropic.com", "api.openai.com", "github.com", "api.github.com", "pypi.org", "files.pythonhosted.org", "registry.npmjs.org", "example.com"],
-  "blocked_patterns": ["rm -rf", "DROP TABLE", "id_rsa", ".env", "AWS_SECRET_ACCESS_KEY"]
+  "mode": "default",
+  "workspace": "./sandbox",
+  "gateway_host": "127.0.0.1",
+  "gateway_port": 8765,
+  "proxy_port": 8080,
+  "approval_timeout_seconds": 60,
+  "host_pass_seconds": 30,
+  "block_on_failure": true,
+
+  "allowed_domains": [
+    "github.com", "api.github.com", "raw.githubusercontent.com",
+    "pypi.org", "files.pythonhosted.org", "registry.npmjs.org",
+    "example.com"
+  ],
+
+  "llm_hosts": [
+    "api.anthropic.com", "api.openai.com", "chatgpt.com",
+    "api.githubcopilot.com", "bedrock-runtime.*.amazonaws.com"
+  ],
+  "ollama_port": 11434,
+
+  "sensitive_paths": [
+    "~/.ssh/*", "~/.aws/*", "~/.kube/config", "~/.gnupg/*",
+    "~/.docker/config.json", "~/.claude/.credentials.json",
+    "~/.codex/auth.json", "**/.env*"
+  ],
+
+  "secret_patterns": [
+    "AKIA[0-9A-Z]{16}",
+    "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    "sk-[A-Za-z0-9_\\-]{20,}",
+    "gh[pousr]_[A-Za-z0-9]{36}",
+    "xox[abpr]-[A-Za-z0-9-]{10,}"
+  ]
 }

@@ -1,0 +1,4 @@
+Meeting notes (demo)
+- Ship the harness demo on Friday
+- Gateway must block rm and exfiltration
+- Summaries go in summary.md
