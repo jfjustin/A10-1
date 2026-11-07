@@ -1,0 +1,5 @@
+{
+  "mode": "allowlist",
+  "allowed_domains": ["api.anthropic.com", "api.openai.com", "github.com", "api.github.com", "pypi.org", "files.pythonhosted.org", "registry.npmjs.org", "example.com"],
+  "blocked_patterns": ["rm -rf", "DROP TABLE", "id_rsa", ".env", "AWS_SECRET_ACCESS_KEY"]
+}
