@@ -1,19 +1,26 @@
-"""Pure network helpers shared by the policy engine and the proxies.
+"""Network helpers shared by the policy engine, the gateway and the proxies.
 
-Host classification, the row-9 "clean URL" test, secret-pattern detection, and
-redaction of secrets in text and headers. No I/O: everything here is a pure
-function so it can be unit-tested offline. (The non-pure `ask_gateway()` client
-and demo stubs are added in a later feature.)
+Pure part: host classification, the row-9 "clean URL" test, secret-pattern
+detection, and redaction of secrets in text and headers.
+
+Non-pure part (bottom of the file): `ask_gateway()`, a small JSON client that
+always bypasses proxies and fails closed, and `demo_stub()`, the offline
+responses for the demo API host api.example.com (only when the caller enables
+demo stubs with --demo-stubs or A10_DEMO_STUBS=1).
 
 Stdlib only.
 """
+import json
 import re
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 
 __all__ = [
     "normalize_host", "split_host_port", "is_local_or_metadata", "host_class",
     "is_clean_url", "has_random_token", "SECRET_PATTERNS", "find_secrets",
     "redact_text", "redact_headers", "urls_in_text", "hosts_in_args",
+    "ask_gateway", "DEMO_STUBS", "demo_stub", "demo_stubs_from_env",
 ]
 
 # Local / metadata hosts (row 19).
@@ -163,6 +170,30 @@ def redact_text(text):
     return out
 
 
+def is_sensitive_header(name):
+    return (name or "").lower() in _SENSITIVE_HEADERS
+
+
+_HEADER_TEXT_RE = re.compile(
+    r"(?i)\b(authorization|proxy-authorization|x-api-key|cookie|set-cookie)"
+    r"(\s*:\s*)(?:([A-Za-z][A-Za-z0-9._-]*)\s+)?([^\s'\"\r\n][^'\"\r\n]*)")
+
+
+def redact_header_text(text):
+    """Redact `Authorization: Bearer xyz`-style header lines inside free text
+    (e.g. a `curl -H '...'` command). Keeps the header name and scheme word."""
+    if not text:
+        return text
+
+    def sub(m):
+        name, sep, scheme, value = m.group(1), m.group(2), m.group(3), m.group(4)
+        if scheme and value:
+            return "%s%s%s [REDACTED len=%d]" % (name, sep, scheme, len(value))
+        return "%s%s[REDACTED len=%d]" % (name, sep, len((scheme or "") + (value or "")))
+
+    return _HEADER_TEXT_RE.sub(sub, text)
+
+
 def redact_headers(headers):
     """Return a copy of `headers` with sensitive values redacted. An auth
     scheme word (e.g. `Bearer`) is kept; the value becomes `[REDACTED len=N]`."""
@@ -212,3 +243,88 @@ def hosts_in_args(argv):
         if m:
             add(m.group(1))
     return hosts
+
+
+# ---------------------------------------------------------------------------
+# Non-pure helpers
+# ---------------------------------------------------------------------------
+
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _parse_body(raw, content_type):
+    text = raw.decode("utf-8", "replace")
+    if "json" in (content_type or "") or text[:1] in ("{", "["):
+        try:
+            return json.loads(text)
+        except ValueError:
+            pass
+    return text
+
+
+def ask_gateway(gateway_url, path, payload=None, timeout=10, headers=None,
+                method=None):
+    """Call the gateway directly (never through a proxy).
+
+    POSTs `payload` as JSON (GET when payload is None). Returns
+    (status, parsed_json_or_text). An HTTP error status is returned as-is; any
+    other failure fails closed as (0, {"verdict": "block", "reason":
+    "gateway unreachable: ..."}).
+    """
+    url = gateway_url.rstrip("/") + path
+    data = None if payload is None else json.dumps(payload).encode()
+    hdrs = {"Content-Type": "application/json"}
+    hdrs.update(headers or {})
+    req = urllib.request.Request(
+        url, data=data, headers=hdrs,
+        method=method or ("GET" if payload is None else "POST"))
+    try:
+        with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, _parse_body(resp.read(),
+                                            resp.headers.get("Content-Type"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read()
+        except Exception:
+            body = b""
+        return e.code, _parse_body(body, e.headers.get("Content-Type")
+                                   if e.headers else "")
+    except Exception as e:  # noqa: BLE001 - fail closed on anything else
+        return 0, {"verdict": "block", "row": "",
+                   "reason": "gateway unreachable: %s" % e}
+
+
+def _stub_status(method, path, body):
+    if method in ("GET", "HEAD") and path == "/status":
+        return 200, {"project": "a10-harness", "status": "ok",
+                     "notes_reviewed": True}
+    if method == "POST" and path == "/notes":
+        return 200, {"ok": True, "received_bytes": len(body or b"")}
+    return 404, {"error": "not found", "path": path}
+
+
+# host -> handler(method, path, body_bytes) -> (status, json_obj)
+DEMO_STUBS = {"api.example.com": _stub_status}
+
+
+def demo_stubs_from_env(environ):
+    return (environ.get("A10_DEMO_STUBS") or "").strip() == "1"
+
+
+def demo_stub(host, method, url_or_path, body=b"", demo_stubs=False):
+    """Offline response for a stubbed demo host, or None.
+
+    Returns (status, json_bytes) when demo stubs are enabled and `host` is in
+    DEMO_STUBS; None otherwise (the caller then forwards for real).
+    """
+    if not demo_stubs:
+        return None
+    handler = DEMO_STUBS.get(normalize_host(host))
+    if handler is None:
+        return None
+    path = url_or_path or "/"
+    if "://" in path:
+        path = urlsplit(path).path or "/"
+    path = path.split("?", 1)[0] or "/"
+    status, obj = handler((method or "GET").upper(), path, body)
+    return status, json.dumps(obj).encode()

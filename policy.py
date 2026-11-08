@@ -159,6 +159,7 @@ class Decision:
     approval_key: str = ""
     hosts: List[str] = field(default_factory=list)
     taint_sources: List[str] = field(default_factory=list)
+    row: str = ""  # the deciding (strictest) row id, '' when none matched
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +218,16 @@ _CURL_DATA_FLAGS = {
     "-d", "--data", "--data-binary", "--data-ascii", "--data-raw",
     "--data-urlencode", "-F", "--form", "--form-string", "-T",
     "--upload-file", "--json",
+}
+# curl/wget flags whose next argv entry is a value, not the URL.
+_CURL_VALUE_FLAGS = {
+    "-H", "--header", "-A", "--user-agent", "-e", "--referer", "-u", "--user",
+    "-b", "--cookie", "-c", "--cookie-jar", "-m", "--max-time",
+    "--connect-timeout", "-w", "--write-out", "-r", "--range", "--retry",
+    "-E", "--cert", "--key", "--cacert", "--capath", "-K", "--config",
+    "--resolve", "--connect-to", "--limit-rate", "-y", "-Y", "-z",
+    "--interface", "--dns-servers", "--max-filesize", "--oauth2-bearer",
+    "--header-file", "-U", "--proxy-user",
 }
 
 
@@ -331,8 +342,22 @@ def is_secret_path(rp):
 def is_protected_path(rp, settings):
     hr = _real(settings.harness_root)
     ws = _real(settings.workspace)
-    if (rp == hr or _inside(rp, hr)) and not (rp == ws or _inside(rp, ws)):
-        return True
+    if rp == hr or _inside(rp, hr):
+        if ws != hr and _inside(ws, hr):
+            # Workspace strictly inside the harness (the demo): only the
+            # workspace itself is writable.
+            if not (rp == ws or _inside(rp, ws)):
+                return True
+        elif ws == hr or _inside(hr, ws):
+            # Workspace equals or contains the harness root (e.g.
+            # `harness.py oh --workspace .` from the repo): only demo-files
+            # stays writable, the harness code itself is still protected.
+            demo = os.path.join(hr, "demo-files")
+            if not (rp == demo or _inside(rp, demo)):
+                return True
+        else:
+            # Workspace elsewhere: the whole harness is protected.
+            return True
     if settings.a10_home:
         ah = _real(settings.a10_home)
         if rp == ah or _inside(rp, ah):
@@ -422,7 +447,8 @@ def _short(text, limit=120):
 # ---------------------------------------------------------------------------
 
 
-def _net_rows(host, port, method, has_body, secret_hits, settings, url=None):
+def _net_rows(host, port, method, has_body, secret_hits, settings, url=None,
+              proxy=False):
     cls = netcheck.host_class(host, port, settings)
     method = (method or "GET").upper()
     is_get = method in ("GET", "HEAD", "OPTIONS", "CONNECT") and not has_body
@@ -433,7 +459,9 @@ def _net_rows(host, port, method, has_body, secret_hits, settings, url=None):
         rows.append(Match("19", host or "", {"host": host}))
     elif cls == "allowlisted":
         rows.append(Match("8", host or "", {"host": host}))
-        if not is_get:
+        # Spec 5.5: any method is row 8 at the proxy level; at the tool level
+        # a sender to an allowlisted host also gets row 6.
+        if not is_get and not proxy:
             rows.append(Match("6", "sender to allowlisted host"))
     else:  # public
         if (not is_get) or secret_hits:
@@ -734,6 +762,14 @@ def _handle_curl(verb, rest, seg, settings, cwd, matches):
         if a == "-O":
             i += 1
             continue
+        if a == "--url":
+            if i + 1 < len(rest) and url is None:
+                url = rest[i + 1]
+            i += 2
+            continue
+        if a in _CURL_VALUE_FLAGS:
+            i += 2
+            continue
         if a.startswith("-"):
             i += 1
             continue
@@ -1027,6 +1063,18 @@ def _classify_segment(seg, settings, cwd, matches):
     argv = seg.argv
     if not argv or argv[0] == "":
         return
+    first = len(matches)
+    try:
+        _classify_segment_inner(seg, settings, cwd, matches)
+    finally:
+        # Remember which shell segment produced each match so the block/ask
+        # reason can quote it (inner `bash -c` segments keep their own text).
+        for m in matches[first:]:
+            m.meta.setdefault("segment", seg.raw or " ".join(argv))
+
+
+def _classify_segment_inner(seg, settings, cwd, matches):
+    argv = seg.argv
     for asg in seg.assignments:
         name = asg.split("=", 1)[0]
         if _is_proxy_var(name):
@@ -1226,7 +1274,7 @@ def classify(action, settings):
         url = inp.get("url")
         host = netcheck.normalize_host(host)
         for m in _net_rows(host, port, method, bool(body_len), secret_hits,
-                           settings, url):
+                           settings, url, proxy=True):
             matches.append(m)
         return matches
     matches.append(Match("14", tool))
@@ -1275,6 +1323,23 @@ def _approval_key(action, settings):
 
 
 def decide(action, settings, state):
+    decision = _decide(action, settings, state)
+    decision.row = _deciding_row(decision)
+    return decision
+
+
+def _deciding_row(decision):
+    rows = decision.rows
+    if not rows:
+        return ""
+    want = decision.verdict
+    if want == "allow" and any(v == "ask" for (_r, _t, v) in rows):
+        want = "ask"  # allowed through an approve-for-run key or a net pass
+    pool = [r for (r, _t, v) in rows if v == want] or [r for (r, _t, _v) in rows]
+    return sorted(pool, key=_row_sort_key, reverse=True)[0]
+
+
+def _decide(action, settings, state):
     matches = classify(action, settings)
     hosts = []
     taint_sources = []
@@ -1353,9 +1418,17 @@ def _pick_strictest(entries):
 def _reason(row_id, title, mode, verdict, match, action):
     glyph = {"block": "⛔", "ask": "❓", "allow": "✅"}[verdict]
     detail = match.detail or ""
+    segment = match.meta.get("segment") or ""
+    if not segment and _canon_tool(action.tool) == "bash":
+        segment = (action.input or {}).get("command") or ""
+    segment = " ".join(str(segment).split())
     where = ""
     if detail:
         where = ": %s" % _short(detail)
+        if segment and segment != detail:
+            where += " in '%s'" % _short(segment, 120)
+    elif segment:
+        where = ": '%s'" % _short(segment, 120)
     return "row %s (%s) is %s in %s mode%s" % (row_id, title, glyph, mode, where)
 
 
