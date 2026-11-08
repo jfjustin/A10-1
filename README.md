@@ -353,15 +353,16 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
   `~/.ssh` without any tool call. The proxy only sees traffic from programs
   that honor the `*_PROXY` environment variables; anything else goes straight
   out. Shell-level outbound channels are caught before this gap applies: a
-  `/dev/tcp`/`/dev/udp` redirect is row 20 (row 19 to loopback) and a
-  bare-host `nc`/`ssh`/`telnet` is row 20, so a command line cannot open a
-  socket the table misses. The remaining gap is a compiled program or a
-  proxy-ignoring client opening its own socket. The full fix is to run the
-  agent in a Docker network whose only exit is the proxy.
-  [docker/README.md](docker/README.md) describes that layout (the
-  agent container on an internal network, mitmproxy as its only exit) and
-  lists the commands that check it. It is **unverified**: it was written on
-  2026-11-07 without Docker or network, so none of it has run.
+  `/dev/tcp`/`/dev/udp` redirect in either direction (`> /dev/tcp/...` or
+  `exec 3</dev/tcp/...`) is row 20 (row 19 to loopback), a bare-host
+  `nc`/`ssh`/`sftp`/`telnet` is row 20, and an `ssh -J`/`ProxyJump` or
+  `ProxyCommand` on the line is classified too. The remaining gap is a
+  compiled program or a proxy-ignoring client opening its own socket from
+  inside a script. The full fix is to run the agent in a Docker network whose
+  only exit is the proxy. [docker/README.md](docker/README.md) describes that
+  layout (the agent container on an internal network, mitmproxy as its only
+  exit) and lists the commands that check it. It is **unverified**: it was
+  written on 2026-11-07 without Docker or network, so none of it has run.
 - **oh's `web_fetch` and `web_search` ignore the proxy.** oh 0.1.9 creates
   their HTTP client with `trust_env=False` (`openharness/utils/network_guard.py`),
   so they skip `*_PROXY` and the CA variables. The gateway still judges them
@@ -414,8 +415,8 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
 
 Run on macOS with Python 3.11.11, mitmproxy 11.0.2, openharness-ai 0.1.9
 and Node 25.1 installed, and no network:
-`python3 -m unittest discover -s tests -v`: 236 tests, OK (skipped=1).
-`python3 -m pytest -q tests -rs`: 235 passed, 1 skipped, 154 subtests passed
+`python3 -m unittest discover -s tests -v`: 267 tests, OK (skipped=1).
+`python3 -m pytest -q tests -rs`: 266 passed, 1 skipped, 195 subtests passed
 (about 29 s). The one skip is the live oh test (`LiveOhTest`), which needs a
 configured provider, network and `A10_LIVE_OH=1`. On a machine without
 mitmproxy, openharness or node, the tests that need them skip too.
@@ -430,13 +431,28 @@ mitmproxy, openharness or node, the tests that need them skip too.
   20, not row 6), `/dev/tcp`/`/dev/udp` redirect channels (row 20, or row 19
   to loopback), a standalone `HTTPS_PROXY=` segment (row 18), loopback
   spellings `127.1`/`0x7f000001`/`::ffff:127.0.0.1`/`*.localhost` (row 19),
-  and `command -v rm` as read-only (row 5, not a row 28 block).
+  and `command -v rm` as read-only (row 5, not a row 28 block). The review v2
+  hardening cases (`ReviewV2Test`, `MetadataEncodingTest`): an inner `-v`
+  after `command` still classifies the inner verb; input redirects
+  (`cat < ~/.ssh/id_rsa` row 16, `cat < .env` row 17,
+  `exec 3</dev/tcp/...` row 20); `>& FILE` as a write (row 4a / row 20);
+  `$HOME`/`${HOME}`/`$PWD`/glob path arguments (rows 16, 4a, 18) with a
+  workspace glob staying allowed; bare `sftp` as row 20; `ssh -J`/`ProxyJump`
+  (row 20), `ProxyCommand` and `nc -e` (row 25), and `ssh -l user` not
+  mistaken for the host; octal/zero-padded/decimal/hex loopback and the
+  metadata IP encodings (row 19); and `export -n`/`declare +x`/`typeset +x`/
+  `readonly PROXY=`/`env -i` as row 18.
 - `tests/test_gateway.py`, `tests/test_audit.py`: hook allow, block and held
   ask; approve, deny with reason, approve-for-run; expiry fails closed; 401
   on control endpoints without the right token; `/mode`, `/override` (only
   with `YES`), `/stop` releasing waiters; Host-header guard; taint from tool
   output; redaction and truncation in events; audit tamper detection and
-  starter-format compatibility.
+  starter-format compatibility. `ControlPlaneBypassTest` replays the review v2
+  chain end to end: in plan mode the agent cannot read the operator token
+  through `cat $HOME/.a10-harness/operator.token` or an input redirect (row 16
+  block, the token never in the response), and a `/dev/tcp` POST to the
+  gateway's own control endpoint is blocked (row 16/19) with the mode left at
+  plan.
 - `tests/test_proxy.py`: stdlib proxy demo stubs, row 20 block for an
   exfiltration POST, row 19 block for `CONNECT` to 127.0.0.1, credential
   headers never reaching events or the audit log, gateway down blocks.

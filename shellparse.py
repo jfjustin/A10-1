@@ -6,7 +6,10 @@ policy (`ls; rm demo-files/notes.txt`) by splitting a command into the pieces
 that actually run and recording the facts the policy engine needs:
 
   * each command's argv after quote removal (`'r'm` and `r\\m` both become `rm`)
-  * write-redirect targets (`>`, `>>`, `>|`, `&>`, `&>>`, `N>`)
+  * write-redirect targets (`>`, `>>`, `>|`, `&>`, `&>>`, `N>`, and `>& FILE`
+    when FILE is not an fd number or `-`)
+  * read-redirect targets (`<`, `N< FILE`), so the policy engine can judge the
+    file being read and spot a `/dev/tcp` socket opened for reading
   * a background flag (trailing `&`)
   * the pipeline the command belongs to (to spot `curl ... | sh`)
   * whether the command came from a command/process substitution
@@ -39,6 +42,7 @@ class Segment:
     argv: List[str] = field(default_factory=list)
     assignments: List[str] = field(default_factory=list)
     write_targets: List[str] = field(default_factory=list)
+    read_targets: List[str] = field(default_factory=list)
     background: bool = False
     pipeline_id: int = 0
     pipeline_pos: int = 0
@@ -111,7 +115,9 @@ def _find_backtick(s, i):
 
 def _tokenize(s):
     """Return (tokens, error). Tokens are ('WORD', value, subs),
-    ('OP', opstr) or ('REDIR', op, is_write, is_heredoc)."""
+    ('OP', opstr) or ('REDIR', op, kind), where kind is 'W' (write target),
+    'R' (read target), 'AMP' (`>&`, resolved at segment build), 'DUP' (fd dup
+    or here-string) or 'HEREDOC'."""
     tokens = []
     i = 0
     n = len(s)
@@ -288,12 +294,12 @@ def _tokenize(s):
         if c == "&":
             if s[i:i + 3] == "&>>":
                 flush_word()
-                tokens.append(("REDIR", "&>>", True, False))
+                tokens.append(("REDIR", "&>>", "W"))
                 i += 3
                 continue
             if s[i:i + 2] == "&>":
                 flush_word()
-                tokens.append(("REDIR", "&>", True, False))
+                tokens.append(("REDIR", "&>", "W"))
                 i += 2
                 continue
             if s[i:i + 2] == "&&":
@@ -348,42 +354,45 @@ def _tokenize(s):
         if c == ">":
             pop_fd()
             if s[i:i + 2] == ">>":
-                tokens.append(("REDIR", ">>", True, False))
+                tokens.append(("REDIR", ">>", "W"))
                 i += 2
                 continue
             if s[i:i + 2] == ">|":
-                tokens.append(("REDIR", ">|", True, False))
+                tokens.append(("REDIR", ">|", "W"))
                 i += 2
                 continue
             if s[i:i + 2] == ">&":
-                tokens.append(("REDIR", ">&", False, False))
+                # `>& word` is an fd dup when word is a number or `-`, but
+                # `>& file` is bash shorthand for `&> file` (a write). The
+                # target is only known at _make_segment time.
+                tokens.append(("REDIR", ">&", "AMP"))
                 i += 2
                 continue
-            tokens.append(("REDIR", ">", True, False))
+            tokens.append(("REDIR", ">", "W"))
             i += 1
             continue
 
         if c == "<":
             pop_fd()
             if s[i:i + 3] == "<<<":
-                tokens.append(("REDIR", "<<<", False, False))
+                tokens.append(("REDIR", "<<<", "DUP"))
                 i += 3
                 continue
             if s[i:i + 3] == "<<-":
-                tokens.append(("REDIR", "<<", False, True))
+                tokens.append(("REDIR", "<<", "HEREDOC"))
                 state["heredoc"] = True
                 i += 3
                 continue
             if s[i:i + 2] == "<<":
-                tokens.append(("REDIR", "<<", False, True))
+                tokens.append(("REDIR", "<<", "HEREDOC"))
                 state["heredoc"] = False
                 i += 2
                 continue
             if s[i:i + 2] == "<&":
-                tokens.append(("REDIR", "<&", False, False))
+                tokens.append(("REDIR", "<&", "DUP"))
                 i += 2
                 continue
-            tokens.append(("REDIR", "<", False, False))
+            tokens.append(("REDIR", "<", "R"))
             i += 1
             continue
 
@@ -403,18 +412,28 @@ def _make_segment(ctoks, pid, pos, from_sub):
     assignments = []
     argv = []
     write_targets = []
+    read_targets = []
     seen_cmd = False
     i = 0
     while i < len(ctoks):
         t = ctoks[i]
         if t[0] == "REDIR":
-            _op, is_write, _hd = t[1], t[2], t[3]
+            kind = t[2]
             target = None
             if i + 1 < len(ctoks) and ctoks[i + 1][0] == "WORD":
                 target = ctoks[i + 1][1]
                 i += 1
-            if is_write and target and target not in _DEVNULL:
-                write_targets.append(target)
+            if target and target not in _DEVNULL:
+                if kind == "W":
+                    write_targets.append(target)
+                elif kind == "R":
+                    read_targets.append(target)
+                elif kind == "AMP":
+                    # `>& FILE` is a write unless FILE is an fd number or `-`.
+                    if not (target.isdigit() or target == "-"):
+                        write_targets.append(target)
+                # DUP / HEREDOC targets are fd numbers or heredoc delimiters,
+                # not files, so they are neither reads nor writes.
             i += 1
             continue
         if t[0] == "WORD":
@@ -433,8 +452,8 @@ def _make_segment(ctoks, pid, pos, from_sub):
     if not raw and assignments:
         raw = " ".join(assignments)
     return Segment(argv=argv, assignments=assignments,
-                   write_targets=write_targets, background=False,
-                   pipeline_id=pid, pipeline_pos=pos,
+                   write_targets=write_targets, read_targets=read_targets,
+                   background=False, pipeline_id=pid, pipeline_pos=pos,
                    from_substitution=from_sub, raw=raw)
 
 

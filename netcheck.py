@@ -11,7 +11,10 @@ demo stubs with --demo-stubs or A10_DEMO_STUBS=1).
 Stdlib only.
 """
 import json
+import ipaddress
 import re
+import socket
+import struct
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -25,9 +28,15 @@ __all__ = [
 
 # Local / metadata hosts (row 19).
 _METADATA_HOSTS = {
-    "localhost", "0.0.0.0", "::1", "169.254.169.254",
     "metadata.google.internal", "host.docker.internal",
 }
+# Metadata IPs as 32-bit ints, so every numeric spelling of the cloud metadata
+# endpoint (169.254.169.254) is caught, not just the dotted-quad. The spec
+# names only 169.254.169.254.
+_METADATA_IPV4_INTS = frozenset(
+    struct.unpack("!I", socket.inet_aton(ip))[0]
+    for ip in ("169.254.169.254",)
+)
 
 # Header names whose values are redacted before display / audit.
 _SENSITIVE_HEADERS = {
@@ -87,39 +96,39 @@ def split_host_port(netloc):
 
 
 def _ipv4_to_int(h):
-    """Parse an IPv4 address written in dotted, short, hex or decimal form to a
-    32-bit int (inet_aton semantics), or None if `h` is not a numeric IPv4
-    address. Catches loopback spellings like 127.1 and 0x7f000001."""
-    parts = h.split(".")
-    if len(parts) > 4:
+    """Parse an IPv4 address written in any form the C resolver accepts
+    (dotted quad, short `127.1`, octal `0177.0.0.1`, hex `0x7f000001`, a single
+    decimal `2130706433`) to a 32-bit int, or None if `h` is not a numeric IPv4
+    address. Uses the platform `inet_aton`, so curl, wget and the resolver see
+    the same value."""
+    if not h or any(c in h for c in " \t/\\%"):
         return None
     try:
-        nums = [int(p, 0) for p in parts]   # base 0 handles 0x.. hex and 0.. octal
+        packed = socket.inet_aton(h)
+    except (OSError, UnicodeError):
+        return None
+    return struct.unpack("!I", packed)[0]
+
+
+def _parse_ipv6(h):
+    """Return an IPv6Address for `h`, or None if it is not one."""
+    try:
+        ip = ipaddress.ip_address(h)
     except ValueError:
         return None
-    if any(n < 0 for n in nums):
-        return None
-    n = len(nums)
-    if n == 1:
-        val = nums[0]
-        return val if 0 <= val <= 0xFFFFFFFF else None
-    # The first n-1 parts are single bytes; the last part fills the rest.
-    if any(p > 0xFF for p in nums[:-1]):
-        return None
-    tail_bytes = 4 - (n - 1)
-    if nums[-1] > (256 ** tail_bytes) - 1:
-        return None
-    val = 0
-    for p in nums[:-1]:
-        val = (val << 8) | p
-    return (val << (8 * tail_bytes)) | nums[-1]
+    return ip if ip.version == 6 else None
+
+
+def _is_loopback_int(val):
+    # 127.0.0.0/8 or 0.0.0.0.
+    return (val >> 24) == 127 or val == 0
 
 
 def _is_loopback_ipv4(h):
     val = _ipv4_to_int(h)
     if val is None:
         return False
-    return (val >> 24) == 127 or val == 0   # 127.0.0.0/8 or 0.0.0.0
+    return _is_loopback_int(val)
 
 
 def is_local_or_metadata(host, port=None):
@@ -131,14 +140,26 @@ def is_local_or_metadata(host, port=None):
     # RFC 6761 reserves *.localhost for loopback.
     if h == "localhost" or h.endswith(".localhost"):
         return True
-    # IPv4-mapped IPv6, e.g. ::ffff:127.0.0.1 (brackets already stripped).
-    if h.startswith("::"):
-        tail = h.rsplit(":", 1)[-1]
-        if "." in tail and _is_loopback_ipv4(tail):
+    # IPv6 literals (brackets already stripped by normalize_host), including
+    # the uncompressed loopback 0:0:0:0:0:0:0:1 and IPv4-mapped forms such as
+    # ::ffff:127.0.0.1 and ::ffff:169.254.169.254.
+    if ":" in h:
+        ip6 = _parse_ipv6(h)
+        if ip6 is not None:
+            if ip6.is_loopback or ip6.is_unspecified:
+                return True
+            mapped = ip6.ipv4_mapped
+            if mapped is not None:
+                v = int(mapped)
+                if _is_loopback_int(v) or v in _METADATA_IPV4_INTS:
+                    return True
+            return False
+    # Dotted/short/octal/hex/decimal IPv4 loopback (127.0.0.0/8), 0.0.0.0 and
+    # the metadata endpoint in any numeric spelling.
+    v = _ipv4_to_int(h)
+    if v is not None:
+        if _is_loopback_int(v) or v in _METADATA_IPV4_INTS:
             return True
-    # Dotted/short/hex/decimal IPv4 loopback (127.0.0.0/8) and 0.0.0.0.
-    if _is_loopback_ipv4(h):
-        return True
     return False
 
 
