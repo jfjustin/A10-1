@@ -86,12 +86,58 @@ def split_host_port(netloc):
     return normalize_host(host), port
 
 
+def _ipv4_to_int(h):
+    """Parse an IPv4 address written in dotted, short, hex or decimal form to a
+    32-bit int (inet_aton semantics), or None if `h` is not a numeric IPv4
+    address. Catches loopback spellings like 127.1 and 0x7f000001."""
+    parts = h.split(".")
+    if len(parts) > 4:
+        return None
+    try:
+        nums = [int(p, 0) for p in parts]   # base 0 handles 0x.. hex and 0.. octal
+    except ValueError:
+        return None
+    if any(n < 0 for n in nums):
+        return None
+    n = len(nums)
+    if n == 1:
+        val = nums[0]
+        return val if 0 <= val <= 0xFFFFFFFF else None
+    # The first n-1 parts are single bytes; the last part fills the rest.
+    if any(p > 0xFF for p in nums[:-1]):
+        return None
+    tail_bytes = 4 - (n - 1)
+    if nums[-1] > (256 ** tail_bytes) - 1:
+        return None
+    val = 0
+    for p in nums[:-1]:
+        val = (val << 8) | p
+    return (val << (8 * tail_bytes)) | nums[-1]
+
+
+def _is_loopback_ipv4(h):
+    val = _ipv4_to_int(h)
+    if val is None:
+        return False
+    return (val >> 24) == 127 or val == 0   # 127.0.0.0/8 or 0.0.0.0
+
+
 def is_local_or_metadata(host, port=None):
     h = normalize_host(host)
+    if not h:
+        return False
     if h in _METADATA_HOSTS:
         return True
-    parts = h.split(".")
-    if len(parts) == 4 and parts[0] == "127" and all(p.isdigit() for p in parts):
+    # RFC 6761 reserves *.localhost for loopback.
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    # IPv4-mapped IPv6, e.g. ::ffff:127.0.0.1 (brackets already stripped).
+    if h.startswith("::"):
+        tail = h.rsplit(":", 1)[-1]
+        if "." in tail and _is_loopback_ipv4(tail):
+            return True
+    # Dotted/short/hex/decimal IPv4 loopback (127.0.0.0/8) and 0.0.0.0.
+    if _is_loopback_ipv4(h):
         return True
     return False
 

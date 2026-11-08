@@ -207,6 +207,8 @@ _DESTRUCTIVE_VERBS = {
 _DESKTOP_VERBS = {"screencapture", "pbpaste", "pbcopy", "cliclick"}
 _SENDER_VERBS = {"scp", "sftp", "rsync", "ssh", "nc", "ncat", "netcat",
                  "socat", "telnet", "ftp", "mail", "sendmail"}
+# scp/sftp/rsync are local copies unless they carry a remote `host:` argument.
+_COPY_SENDERS = {"scp", "sftp", "rsync"}
 _NETWORK_VERBS = {"curl", "wget", "http", "https"}
 _READONLY_GIT = {"status", "diff", "log", "show", "rev-parse", "ls-files",
                  "blame", "remote", "describe", "shortlog", "branch"}
@@ -492,6 +494,33 @@ def _host_from_token(token):
     return None, None
 
 
+def _is_dev_socket(target):
+    """True for a bash /dev/tcp or /dev/udp pseudo-path, which opens an outbound
+    socket that honours no proxy variable and never reaches mitmproxy."""
+    t = target or ""
+    return t.startswith("/dev/tcp/") or t.startswith("/dev/udp/")
+
+
+def _dev_socket_hostport(target):
+    # /dev/tcp/<host>/<port>
+    parts = (target or "").split("/")
+    host = parts[3] if len(parts) > 3 else ""
+    port = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None
+    return netcheck.normalize_host(host), port
+
+
+def _flag_proxy_assignments(seg, matches):
+    """Flag proxy/CA-variable assignments on a segment (row 18). Called for
+    assignment-only segments (empty argv), which the normal per-segment path
+    skips, so `HTTPS_PROXY= ; curl ...` cannot silently unset the proxy."""
+    for asg in seg.assignments:
+        name = asg.split("=", 1)[0]
+        if _is_proxy_var(name):
+            m = Match("18", "sets %s" % name)
+            m.meta["segment"] = seg.raw or asg
+            matches.append(m)
+
+
 # ---------------------------------------------------------------------------
 # Shell handlers (spec 5.4)
 # ---------------------------------------------------------------------------
@@ -697,10 +726,34 @@ def _handle_git(rest, seg, settings, cwd, matches):
     return False
 
 
+def _bare_sender_host(rest):
+    """First bare, non-flag, non-numeric token of a sender command (the host in
+    `nc evil.example 4444` / `ssh evil.example cmd`). Returns None if none."""
+    for tok in rest:
+        if tok.startswith("-"):
+            continue
+        if tok.isdigit():   # a bare port, not a host
+            continue
+        return tok.split("/", 1)[0]
+    return None
+
+
 def _handle_sender(verb, rest, seg, settings, cwd, matches):
     hosts = netcheck.hosts_in_args([verb] + rest)
+    if not hosts and verb not in _COPY_SENDERS:
+        # ssh/nc/telnet/... take the host as a bare positional argument that
+        # hosts_in_args (URL/scp/user@host only) does not see.
+        h = _bare_sender_host(rest)
+        if h:
+            hosts = [h]
     if not hosts:
-        matches.append(Match("6", verb))
+        if verb in _COPY_SENDERS:
+            # Local copy with no remote host (e.g. `rsync -a a b`).
+            matches.append(Match("6", verb))
+        else:
+            # A sender reaching an unidentified host is not allowlisted, so the
+            # safe reading is "send to an unknown host" (row 20), not row 6.
+            matches.append(Match("20", verb, {"host": ""}))
         return False
     for h in hosts:
         host, port = netcheck.split_host_port(h)
@@ -820,6 +873,8 @@ def _classify_subcommand(cmd, seg, settings, cwd, matches):
     for s in res.segments:
         if s.argv and s.argv[0]:
             _classify_segment(s, settings, cwd, matches)
+        else:
+            _flag_proxy_assignments(s, matches)
 
 
 def _classify_verb(argv, seg, settings, cwd, matches):
@@ -844,7 +899,16 @@ def _classify_verb(argv, seg, settings, cwd, matches):
         if inner:
             _classify_verb(inner, seg, settings, cwd, matches)
         return False
-    if verb in ("command", "builtin", "exec"):
+    if verb in ("command", "builtin"):
+        # `command -v/-V rm` and `builtin -v` only resolve a name; they run
+        # nothing, so treat them as read-only instead of classifying the inner
+        # verb (otherwise `command -v rm` is wrongly blocked as row 28).
+        if any(a in ("-v", "-V") for a in rest):
+            matches.append(Match("5", "%s -v (introspection)" % verb))
+            return True
+        inner = _skip_flags(rest)
+        return _classify_verb(inner, seg, settings, cwd, matches) if inner else False
+    if verb == "exec":
         inner = _skip_flags(rest)
         return _classify_verb(inner, seg, settings, cwd, matches) if inner else False
     if verb in ("time", "nice"):
@@ -1094,6 +1158,12 @@ def _classify_segment_inner(seg, settings, cwd, matches):
 
     write_targets = _collect_write_targets(seg, settings, cwd)
     for wt in write_targets:
+        if _is_dev_socket(wt):
+            # A redirect into /dev/tcp/<host>/<port> is an outbound send.
+            host, port = _dev_socket_hostport(wt)
+            for m in _net_rows(host, port, "POST", True, [], settings):
+                matches.append(m)
+            continue
         rp = resolve_path(wt, cwd, settings)
         _path_rows(rp, matches, "wtarget", settings)
 
@@ -1120,6 +1190,7 @@ def _classify_shell(command, settings, base_cwd, matches):
     cur_cwd = base_cwd
     for seg in segs:
         if not seg.argv or seg.argv[0] == "":
+            _flag_proxy_assignments(seg, matches)
             if seg.background:
                 matches.append(Match("24", "background &"))
             continue

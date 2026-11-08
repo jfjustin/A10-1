@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # A10 Agent Harness: a control layer for CLI agents
 
 Hackathon track A10, Prompt 2: "Build a control layer for desktop and
@@ -488,3 +489,7 @@ oh.
   must fail, and `curl -s https://example.com` from it must show up in the
   console).
 - Push to [jfjustin/A10-1 on GitHub](https://github.com/jfjustin/A10-1).
+=======
+# A10-1
+A10Hackathon
+>>>>>>> ebb9e11bad0f0a52b77172ad8d20c01d20ebbfbe
