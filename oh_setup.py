@@ -7,7 +7,7 @@ the user's own oh configuration:
                         {"OPENHARNESS_CONFIG_DIR": <that dir>} for oh's env.
                         settings.json (0600) is the user's settings with the
                         gateway's pre_tool_use / post_tool_use HTTP hooks
-                        placed first (priority 1000); every other entry of the
+                        placed first in each list; every other entry of the
                         user's config dir (credentials.json, data/, logs/, ...)
                         is symlinked, never copied. Nothing is ever written to
                         the user's dir.
@@ -18,11 +18,21 @@ CLI (generates docker/oh-settings.json for the Docker layout):
   python3 oh_setup.py --print-hooks --gateway-url http://gateway:8000 \\
       > docker/oh-settings.json
 
-Facts about oh this relies on (read from github.com/HKUDS/OpenHarness): oh
-loads settings only from $OPENHARNESS_CONFIG_DIR/settings.json (default
-~/.openharness/settings.json); an http hook POSTs {"event", "payload"} and,
-with block_on_failure, a non-2xx answer blocks the tool and the response text
-becomes the tool error; the hook timeout is capped at 600 s.
+Facts about oh this relies on, checked against the installed openharness-ai
+0.1.9 source (paths relative to site-packages/openharness/):
+  - oh reads settings only from $OPENHARNESS_CONFIG_DIR/settings.json
+    (default ~/.openharness/settings.json): config/paths.py get_config_dir().
+  - Hook entries are pydantic models (hooks/schemas.py HttpHookDefinition:
+    type "http", url, headers, timeout_seconds 1..600, matcher,
+    block_on_failure). Unknown keys such as our "priority" are ignored; hooks
+    run in list order (hooks/loader.py), every matching hook runs, and any
+    blocking result blocks (hooks/types.py AggregatedHookResult).
+  - An http hook POSTs {"event", "payload"} with httpx (trust_env, so
+    NO_PROXY applies). A non-2xx answer with block_on_failure blocks the
+    tool, and the response text becomes the tool error the model sees
+    (hooks/executor.py _run_http_hook, engine/query.py _execute_tool_call).
+  - The active profile and the API host oh calls: see active_profile() and
+    provider_hosts().
 
 Stdlib only.
 """
@@ -30,39 +40,47 @@ import argparse
 import json
 import os
 import sys
+from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
 DEFAULT_PROFILE = "claude-api"
-OLLAMA_HOST = "localhost:11434"
-HOOK_PRIORITY = 1000
+HOOK_PRIORITY = 1000  # ignored by oh 0.1.9 (list order counts); kept for
+#                       oh versions that sort hooks by priority
 PRE_TIMEOUT = 600     # oh's hook cap; the gateway answers within --approval-wait
 POST_TIMEOUT = 10
 SETTINGS_NAME = "settings.json"
 CONFIG_SUBDIR = "oh-config"
 
-# Built-in oh profiles (name -> provider) used when settings.json does not
-# define the active profile itself.
+# oh 0.1.9's built-in profile catalog (config/settings.py
+# default_provider_profiles): name -> provider, api_format, base_url.
+# There is no built-in Ollama profile: Ollama is an OpenAI-compatible profile
+# with base_url http://localhost:11434/v1 (api/registry.py).
 BUILTIN_PROFILES = {
-    "claude-api": {"provider": "anthropic"},
-    "claude-subscription": {"provider": "anthropic_claude"},
-    "openai-compatible": {"provider": "openai"},
-    "codex": {"provider": "openai_codex"},
+    "claude-api": {"provider": "anthropic", "api_format": "anthropic"},
+    "claude-subscription": {"provider": "anthropic_claude",
+                            "api_format": "anthropic"},
+    "openai-compatible": {"provider": "openai", "api_format": "openai"},
+    "codex": {"provider": "openai_codex", "api_format": "openai"},
+    "copilot": {"provider": "copilot", "api_format": "copilot"},
+    "moonshot": {"provider": "moonshot", "api_format": "openai",
+                 "base_url": "https://api.moonshot.cn/v1"},
+    "gemini": {"provider": "gemini", "api_format": "openai",
+               "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
+    "minimax": {"provider": "minimax", "api_format": "openai",
+                "base_url": "https://api.minimax.io/v1"},
+    "nvidia": {"provider": "nvidia", "api_format": "openai",
+               "base_url": "https://integrate.api.nvidia.com/v1"},
+    "qwen": {"provider": "dashscope", "api_format": "openai",
+             "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+    "modelscope": {"provider": "modelscope", "api_format": "openai",
+                   "base_url": "https://api-inference.modelscope.cn/v1"},
 }
 
-# Provider -> host when the profile has no base_url.
-PROVIDER_HOSTS = {
-    "anthropic": "api.anthropic.com",
-    "anthropic_claude": "api.anthropic.com",
-    "openai": "api.openai.com",
-    "openai_codex": "chatgpt.com",
-    "copilot": "api.githubcopilot.com",
-    "github_copilot": "api.githubcopilot.com",
-    "ollama": OLLAMA_HOST,
-}
-
-# Top-level keys of an older "flat" settings.json (no profiles section).
-FLAT_KEYS = ("provider", "api_format", "base_url", "auth_source", "model",
-             "default_model")
+# Default API hosts of oh's clients when the profile has no base_url.
+ANTHROPIC_HOST = "api.anthropic.com"   # anthropic SDK (ANTHROPIC_BASE_URL)
+OPENAI_HOST = "api.openai.com"         # openai SDK (OPENAI_BASE_URL)
+CODEX_HOST = "chatgpt.com"             # api/codex_client.py DEFAULT_CODEX_BASE_URL
+COPILOT_HOST = "api.githubcopilot.com"  # api/copilot_auth.py COPILOT_DEFAULT_API_BASE
 
 
 def user_config_dir(env=None):
@@ -82,29 +100,82 @@ def load_user_settings(user_dir):
     return data if isinstance(data, dict) else {}
 
 
-def active_profile(settings, env=None):
-    """-> (profile_name, profile_dict).
+def _text(value):
+    return value.strip() if isinstance(value, str) else ""
 
-    Name: $OPENHARNESS_PROFILE, then settings["active_profile"], then
-    'claude-api'. A profile of that name in settings["profiles"] wins.
-    Otherwise flat top-level keys (provider and/or base_url, an older settings
-    layout) are used on top of the built-in profile, unless the env override
-    is set. Otherwise the built-in profile of that name ({} when unknown).
+
+def _slug(value):
+    """oh's _slugify_profile_name."""
+    cleaned = "".join(ch.lower() if ch.isalnum() else "-"
+                      for ch in value).strip("-")
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned or "custom"
+
+
+def _flat_profile(settings):
+    """oh's _profile_from_flat_settings: (name, profile) from the top-level
+    provider / api_format / base_url keys (api_format defaults to
+    'anthropic' as in oh's Settings model)."""
+    provider = _text(settings.get("provider"))
+    fmt = _text(settings.get("api_format")) or "anthropic"
+    base_url = _text(settings.get("base_url")) or None
+    if provider == "openai_codex":
+        name = "codex"
+    elif provider == "anthropic_claude":
+        name = "claude-subscription"
+    elif provider == "copilot" or fmt == "copilot":
+        name = "copilot"
+    elif provider == "openai" and not base_url:
+        name = "openai-compatible"
+    elif provider == "anthropic" and not base_url:
+        name = DEFAULT_PROFILE
+    elif base_url:
+        name = _slug(PurePosixPath(base_url).name or base_url)
+    elif provider:
+        name = _slug(provider)
+    else:
+        name = DEFAULT_PROFILE
+    builtin = BUILTIN_PROFILES.get(name)
+    if (builtin and provider in ("", builtin["provider"])
+            and builtin["api_format"] == fmt
+            and builtin.get("base_url") == base_url):
+        return name, dict(builtin)
+    if not provider:
+        provider = {"copilot": "copilot", "openai": "openai"}.get(fmt,
+                                                                  "anthropic")
+    return name, {"provider": provider, "api_format": fmt,
+                  "base_url": base_url}
+
+
+def active_profile(settings):
+    """-> (profile_name, profile_dict), resolved the way oh 0.1.9 does it
+    (config/settings.py load_settings and Settings.resolve_profile).
+
+    With both "active_profile" and "profiles" in settings.json: the named
+    profile from the user's profiles merged over the built-in catalog (a
+    user profile without base_url inherits the built-in one's), default
+    'claude-api'. When either key is missing, or the name is unknown, oh
+    ignores active_profile and infers the profile from the flat top-level
+    keys (default 'claude-api'). oh reads no environment variable to pick a
+    profile, so neither does this.
     """
-    env = os.environ if env is None else env
     settings = settings if isinstance(settings, dict) else {}
     profiles = settings.get("profiles")
-    profiles = profiles if isinstance(profiles, dict) else {}
-    override = str(env.get("OPENHARNESS_PROFILE") or "").strip()
-    name = (override or str(settings.get("active_profile") or "").strip()
-            or DEFAULT_PROFILE)
-    if isinstance(profiles.get(name), dict):
-        return name, dict(profiles[name])
-    builtin = dict(BUILTIN_PROFILES.get(name, {}))
-    flat = {k: settings[k] for k in FLAT_KEYS if settings.get(k)}
-    if not override and (flat.get("provider") or flat.get("base_url")):
-        builtin.update(flat)
-    return name, builtin
+    if "active_profile" in settings and isinstance(profiles, dict):
+        merged = {n: dict(p) for n, p in BUILTIN_PROFILES.items()}
+        for n, p in profiles.items():
+            if not isinstance(p, dict):
+                continue
+            p = dict(p)
+            builtin_url = BUILTIN_PROFILES.get(n, {}).get("base_url")
+            if p.get("base_url") is None and builtin_url:
+                p["base_url"] = builtin_url
+            merged[n] = p
+        name = _text(settings.get("active_profile")) or DEFAULT_PROFILE
+        if name in merged:
+            return name, merged[name]
+    return _flat_profile(settings)
 
 
 def _host_of(base_url):
@@ -126,32 +197,43 @@ def _host_of(base_url):
 
 
 def provider_hosts(settings, env=None):
-    """Hosts for row 10: only the active profile's LLM provider.
+    """Hosts for row 10: only the API host oh's active profile calls.
 
-    base_url set -> its host[:port] (e.g. 'localhost:11434' for
-    http://localhost:11434/v1). Otherwise the provider's default host:
-    anthropic / anthropic_claude -> api.anthropic.com, openai ->
-    api.openai.com, ollama -> localhost:11434.
-
-    Unconfirmed defaults (spec section 7: check with a live oh run): the Codex
-    subscription profile (openai_codex) -> chatgpt.com and Copilot ->
-    api.githubcopilot.com. The Claude subscription bridge is assumed to call
-    api.anthropic.com. Pass --provider-host to override.
+    Mirrors oh 0.1.9's client choice (ui/runtime.py
+    _resolve_api_client_from_settings):
+      api_format 'copilot'      -> api.githubcopilot.com (oh ignores the
+                                   profile's base_url; GitHub Enterprise uses
+                                   copilot-api.<domain>, not detected)
+      base_url set              -> its host[:port] (Ollama:
+                                   http://localhost:11434/v1 -> localhost:11434)
+      provider 'openai_codex'   -> chatgpt.com
+      api_format 'openai'       -> $OPENAI_BASE_URL's host, else api.openai.com
+      anything else (Anthropic) -> $ANTHROPIC_BASE_URL's host, else
+                                   api.anthropic.com (also the Claude
+                                   subscription)
+    The two *_BASE_URL variables are read by the anthropic / openai SDKs when
+    oh passes no base_url. Not detected: oh's --base-url flag, and the Claude
+    subscription's token refresh at platform.claude.com. Pass --provider-host
+    to override.
     """
-    name, prof = active_profile(settings, env)
-    base_url = prof.get("base_url")
-    if base_url:
-        host = _host_of(base_url)
-        return {host} if host else set()
-    provider = str(prof.get("provider") or "").strip().lower()
-    hint = (provider + " " + name).lower()
-    if "ollama" in hint:
-        return {OLLAMA_HOST}
-    if "copilot" in hint:
-        return {PROVIDER_HOSTS["copilot"]}
-    host = PROVIDER_HOSTS.get(provider)
-    if host is None and not provider:
-        host = PROVIDER_HOSTS.get(BUILTIN_PROFILES.get(name, {}).get("provider"))
+    env = os.environ if env is None else env
+    _, prof = active_profile(settings)
+    provider = _text(prof.get("provider"))
+    fmt = _text(prof.get("api_format"))
+    base_url = _text(prof.get("base_url"))
+    if fmt == "copilot":
+        return {COPILOT_HOST}
+    if not base_url and provider == "openai_codex":
+        return {CODEX_HOST}
+    if not base_url:
+        if provider != "anthropic_claude" and fmt in ("openai", "openai_compat"):
+            base_url, default = _text(env.get("OPENAI_BASE_URL")), OPENAI_HOST
+        else:
+            base_url = _text(env.get("ANTHROPIC_BASE_URL"))
+            default = ANTHROPIC_HOST
+        if not base_url:
+            return {default}
+    host = _host_of(base_url)
     return {host} if host else set()
 
 

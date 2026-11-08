@@ -141,7 +141,7 @@ Some notes on specific rows:
 |---|---|---|
 | `taint_tracking` | on | After the run reads private data (rows 2, 16, 17, or any tool output matching a secret pattern), every request to a non-allowlisted host becomes ❓ in all modes, including clean GETs in auto |
 | `clean_url` | on in auto | Row 9 allows only URLs with no query string, no fragment, no path segment > 32 chars, no hex/base64-looking segment > 16 chars |
-| `provider_host` | read from oh's active profile at run start | Row 10 allows only this host (which hosts the Claude/Codex subscription bridges use is still to be confirmed) |
+| `provider_host` | read from oh's active profile at run start | Row 10 allows only this host, chosen the way oh 0.1.9 picks its API client. README "Known gaps" lists what the detection does not see |
 | `approval_wait` | until operator answers, up to 600 s | Bell + macOS notification while waiting; fails closed after the cap |
 | `override` | typed `YES` | Logged in audit chain |
 | `operator_token` | `~/.a10-harness/operator.token`, mode 0600 | Required by `/stop`, `/approve`, `/mode`, `/reset` (and `/override`); never in the agent's env |

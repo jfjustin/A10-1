@@ -139,7 +139,6 @@ services:
       NODE_EXTRA_CA_CERTS: /a10/mitm-ca/mitmproxy-ca-cert.pem
       OPENHARNESS_CONFIG_DIR: /a10/oh-config
       # Passed through from your shell only when set there.
-      OPENHARNESS_PROFILE:
       ANTHROPIC_API_KEY:
       OPENAI_API_KEY:
     volumes:

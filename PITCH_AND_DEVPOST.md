@@ -62,8 +62,10 @@ planted `rm` becomes an ask you could approve by mistake.
 - "Does it work with a real LLM agent?" `python3 harness.py oh` runs
   OpenHarness with the gateway as its `pre_tool_use` hook, so every tool call
   of any oh-driven model is judged. The scripted demo agent sends the exact
-  same hook payloads. The oh path is tested offline with a fake `oh`; a live
-  run with a real provider needs network (README, "Verification status").
+  same hook payloads. The oh path is tested offline with a fake `oh` and
+  with the installed oh 0.1.9's own settings loader and hook executor
+  calling the gateway; a live run with a real provider needs network
+  (README, "Verification status").
 - "What about Claude Code or Codex directly?"
   `python3 harness.py run -- claude` puts any CLI agent behind the proxy.
   Without oh's hook only its network traffic is judged.
@@ -127,14 +129,15 @@ Judging criteria (from the DevPost page) and what to lean on:
   `console.py` (terminal operator console), `proxy.py` (no-install proxy),
   `audit.py` (hash chain). `mitm_addon.py` plugs into mitmproxy and
   `oh_setup.py` points OpenHarness's `pre_tool_use` HTTP hook at the gateway.
-  211 offline tests (unittest, also run under pytest).
+  236 offline tests (unittest, also run under pytest), including runs
+  against the real mitmproxy 11.0.2 and openharness 0.1.9.
 - **Challenges:** Making the block happen *before* execution, not after;
   shell commands that hide `rm` behind `;`, `$()` or quotes; GETs that carry
   secrets in the URL; trusting the mitmproxy CA in the agent only, without
   touching the keychain; keeping the demo visual in 60 seconds.
 - **What's next:** run and verify the Docker layout in `docker/` (written,
   not yet run) whose only exit is the proxy, closing the row 6 gap; live runs
-  with real providers to confirm the subscription and Copilot hosts; the row
+  with real providers, including the subscription and Copilot logins; the row
   11 subagent test; per-agent policies.
 - **Built with:** Python (stdlib core), mitmproxy, OpenHarness (oh).
   **Track:** A10, Prompt 2: Agent Harness. **Scope:** CLI agents only.
@@ -144,9 +147,10 @@ Judging criteria (from the DevPost page) and what to lean on:
 - Check-in 9:00 AM, Heafey Atrium / Bergin; hacking from 11:00 AM, overnight.
 - Copy this whole folder to the laptop; run `python3 harness.py demo` once
   to confirm (type `a` at the pending write, `s` at the end), then delete
-  `audit.log.jsonl` and `demo-files/summary.md` for a clean demo. While
-  there is network, `pip install mitmproxy openharness-ai` and run the
-  skipped tests.
+  `audit.log.jsonl` and `demo-files/summary.md` for a clean demo. If the
+  demo laptop lacks mitmproxy or openharness-ai, `pip install mitmproxy
+  openharness-ai` while there is network and run the tests again
+  (`python3 -m pytest -q tests -rs` lists what was skipped).
 - Weather: Sat high 76°F, sunny, rain 0% in the day; overnight low 54°F,
   rain ~20% late night (11 PM–8 AM); Sun high 73°F, AM clouds / PM sun.
   Bring a warm layer for the overnight.

@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # A10 Agent Harness: a control layer for CLI agents
 
 Hackathon track A10, Prompt 2: "Build a control layer for desktop and
@@ -156,8 +155,10 @@ python3 -m pytest -q tests        # same tests, if pytest is installed
 ```
 
 The tests use ephemeral ports and a temporary `A10_HOME`, so they never touch
-your `~/.a10-harness` or the repo's audit log. Four tests need the real
-mitmproxy or oh and are skipped when those are not installed.
+your `~/.a10-harness` or the repo's audit log. Tests that need the real
+`mitmdump`, the `openharness` package or `node` run when those are installed
+and are skipped otherwise. The live oh test also needs a configured provider,
+network and `A10_LIVE_OH=1`, so it is skipped by default.
 
 ## What it does
 
@@ -361,14 +362,23 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
   agent container on an internal network, mitmproxy as its only exit) and
   lists the commands that check it. It is **unverified**: it was written on
   2026-11-07 without Docker or network, so none of it has run.
-- **oh's `web_fetch` and `web_search` ignore the proxy.** oh creates their
-  HTTP client with `trust_env=False`, so they skip `*_PROXY` and the CA
-  variables. The gateway still judges them at the tool level (URL, host,
-  clean-URL and taint checks), but the proxy never sees those requests. The
-  harness removes `OPENHARNESS_WEB_PROXY` from oh's environment because TLS
-  through mitmproxy would fail without the CA.
+- **oh's `web_fetch` and `web_search` ignore the proxy.** oh 0.1.9 creates
+  their HTTP client with `trust_env=False` (`openharness/utils/network_guard.py`),
+  so they skip `*_PROXY` and the CA variables. The gateway still judges them
+  at the tool level (URL, host, clean-URL and taint checks), and oh itself
+  refuses URLs that resolve to loopback or private addresses, but the proxy
+  never sees those requests. oh 0.1.9 has no `OPENHARNESS_WEB_PROXY`
+  setting; the harness removes that variable from oh's environment anyway in
+  case another version adds one.
+- **oh rereads its settings file.** Before each prompt, oh 0.1.9 reloads its
+  hooks from `~/.a10-harness/oh-config/settings.json`. Writing that file
+  through a tool is row 18 (⛔), but a script (row 6) could remove the
+  gateway hooks for later prompts. The Docker layout mounts the file
+  read-only.
 - **Node's built-in `fetch` ignores `HTTPS_PROXY`.** Node agents that use it
   instead of a proxy-aware client bypass the proxy, the same way as row 6.
+  Node 24 and later honor the proxy variables when `NODE_USE_ENV_PROXY=1` is
+  set; the harness does not set it.
 - **The stdlib proxy cannot decrypt HTTPS.** It sees only the `CONNECT` host
   and judges it like a GET to that host (row 9). It cannot see the method,
   path or body, so an HTTPS POST to an unknown host is an ask, not a row 20
@@ -378,11 +388,17 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
 - **Row 11 stays ⛔ in every mode** until the subagent test below passes. We
   have not confirmed that tool calls made by oh subagents go through the
   same hooks.
-- **Subscription and Copilot provider hosts are unconfirmed.** Row 10 assumes
-  `api.anthropic.com` for the Claude subscription, `chatgpt.com` for Codex and
-  `api.githubcopilot.com` for Copilot. If a profile uses another host, its
-  traffic is judged as an unknown host (an ask in default mode). Pass the
-  right host with `--provider-host`.
+- **Provider host detection covers the settings file, not every override.**
+  Row 10 follows how oh 0.1.9 picks its API client: `api.anthropic.com` for
+  the Claude API and the Claude subscription, `chatgpt.com` for Codex,
+  `api.githubcopilot.com` for Copilot, `api.openai.com` for OpenAI, the
+  profile's `base_url` host otherwise (Ollama: `localhost:11434`), and
+  `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` when the profile has no
+  `base_url`. It does not see oh's `--base-url` flag, GitHub Enterprise
+  Copilot (`copilot-api.<domain>`), or the Claude subscription's token
+  refresh at `platform.claude.com` (then `console.anthropic.com`). Those
+  hosts are judged as unknown hosts (an ask in default mode); pass
+  `--provider-host` to allow one.
 - **Ollama at the tool level.** The provider entry is `localhost:11434`; a
   tool-level `curl http://127.0.0.1:11434` does not match it and is row 19
   (⛔). oh's own Ollama traffic is not affected because it does not go through
@@ -396,10 +412,13 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
 
 ### Verified offline on 2026-11-07
 
-`python3 -m unittest discover -s tests -v`: 223 tests, OK. `python3 -m pytest
--q tests`: 222 passed, 111 subtests passed (about 23 s). Between one and four
-tests skip depending on whether `mitmproxy` and `oh` are importable; they are
-the ones that need a real mitmproxy or oh.
+Run on macOS with Python 3.11.11, mitmproxy 11.0.2, openharness-ai 0.1.9
+and Node 25.1 installed, and no network:
+`python3 -m unittest discover -s tests -v`: 236 tests, OK (skipped=1).
+`python3 -m pytest -q tests -rs`: 235 passed, 1 skipped, 154 subtests passed
+(about 29 s). The one skip is the live oh test (`LiveOhTest`), which needs a
+configured provider, network and `A10_LIVE_OH=1`. On a machine without
+mitmproxy, openharness or node, the tests that need them skip too.
 
 - `tests/test_policy.py`, `tests/test_shellparse.py`: the row table matches
   the approved table cell by cell; at least one example per row in all three
@@ -434,10 +453,25 @@ the ones that need a real mitmproxy or oh.
   stub for `api.example.com`, 403 for a POST to an unknown host, header
   redaction, fail closed on gateway errors, judging by the real destination
   rather than a spoofed `Host` header, raw TCP inside a tunnel, TLS failure
-  notes; plus an end-to-end run against a live gateway.
-- `tests/test_oh_setup.py`: the oh config directory (hooks first at priority
-  1000, user settings kept, `credentials.json` symlinked, user directory
+  notes; plus an end-to-end run against a live gateway. With the real
+  mitmproxy 11.0.2 (`RealMitmproxyTest`): `mitm_addon.py` loaded through
+  mitmproxy's own test harness (`mitmproxy.test.taddons`) blocks a POST to an
+  unknown host and serves the stub, using real flow and response objects.
+- `tests/test_oh_setup.py`: the oh config directory (hooks first in each
+  list, user settings kept, `credentials.json` symlinked, user directory
   unchanged, idempotent) and provider host detection for each profile type.
+  With the installed openharness 0.1.9 (`OhSourceTest`, no provider and no
+  LLM call): oh's own settings loader reads the generated `settings.json`
+  from `OPENHARNESS_CONFIG_DIR`; oh's own hook executor, run with the
+  environment `harness.py oh` gives oh (proxy variables pointing at a dead
+  proxy, `NO_PROXY` for the gateway), calls a live gateway and gets a block
+  with the row 28 reason for `rm demo-files/notes.txt`, an allow for
+  `ls demo-files`, a row 3 ask held until the operator approves, and taint
+  from a secret in `post_tool_use` output; a down gateway blocks; oh's own
+  client factory (fake API keys, nothing sent) picks the same API host as
+  the row 10 detection for ten settings layouts and the
+  `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` variables; the built-in profile
+  catalog and the Codex and Copilot default hosts match.
 - `tests/test_harness_oh.py`: `harness.py oh` with a fake `oh` on PATH:
   launched with `--permission-mode full_auto`, proxy variables set, no
   operator token in its environment, its hook calls get 403 for `rm` (row 28)
@@ -445,7 +479,20 @@ the ones that need a real mitmproxy or oh.
 - `tests/test_harness_run.py`: `harness.py run -- curl ...` through the stdlib
   proxy (stub allowed as row 8, exfiltration 403 as row 20); `--proxy mitm`
   lifecycle and agent-only CA variables with a fake `mitmdump`; `harness.py
-  demo` with piped console input.
+  demo` with piped console input. With the real mitmdump 11.0.2
+  (`RealMitmdumpRunTest`, offline because `connection_strategy=lazy` never
+  opens an upstream connection for a stubbed or blocked request):
+  `harness.py run --proxy mitm --demo-stubs -- curl -s
+  https://api.example.com/status` gets the stub over decrypted HTTPS, and an
+  HTTPS POST to `exfil.evil.example` gets the row 20 403; Python `requests`
+  (`REQUESTS_CA_BUNDLE`), `urllib` and `httpx` (`SSL_CERT_FILE`; oh's
+  Anthropic and OpenAI SDKs use httpx) trust the agent-only CA; Node's
+  `fetch` trusts it through `NODE_EXTRA_CA_CERTS` when `NODE_USE_ENV_PROXY=1`
+  makes it use the proxy. `harness.py demo --proxy mitm` runs the full demo
+  with the real mitmdump (`DemoCommandTest`).
+- `tests/test_docs.py`: no merge-conflict markers in any tracked `.md`,
+  `.py`, `.yml` or `.json` file, the README starts with its title, and
+  `.gitignore` has no duplicate lines.
 - `tests/test_docker_layout.py`: static text checks of `docker/` only (no
   Docker, no PyYAML): the agent service is on the internal `agentnet` only,
   with no operator token, `docker.sock` or harness code mounted; the console
@@ -462,19 +509,56 @@ the ones that need a real mitmproxy or oh.
   `audit chain ✓ verified (12 entries)`. A second run that stopped mid-run
   showed the harness killing the agent's process tree.
 
+### Read from the installed openharness-ai 0.1.9 source
+
+Paths are relative to the installed `openharness/` package.
+
+- **Hook entries.** `hooks/schemas.py` `HttpHookDefinition` has `type`,
+  `url`, `headers`, `timeout_seconds` (1 to 600), `matcher` and
+  `block_on_failure`. The generated entries validate as written. oh drops
+  the extra `priority` key and runs hooks in list order (`hooks/loader.py`),
+  so the gateway's hook is first because it is first in the list. Every
+  matching hook runs, and any blocking result blocks the tool
+  (`hooks/types.py`).
+- **Request.** `hooks/executor.py` `_run_http_hook` POSTs
+  `{"event": ..., "payload": ...}` with httpx, which honors `*_PROXY` and
+  `NO_PROXY`. The `pre_tool_use` payload is `{tool_name, tool_input, event}`
+  and `post_tool_use` adds `tool_output` and `tool_is_error`
+  (`engine/query.py` `_execute_tool_call`). These are the fields `/hooks/oh`
+  reads.
+- **Response.** A non-2xx answer with `block_on_failure` blocks the tool, and
+  the response text becomes the tool result with `is_error` set, so the model
+  sees the gateway's reason. A timeout or connection error also blocks. The
+  hook runs before oh's own permission check and before the tool lookup.
+- **Settings and profiles.** oh reads only
+  `$OPENHARNESS_CONFIG_DIR/settings.json` (`config/paths.py`). Built-in
+  profiles (`config/settings.py` `default_provider_profiles`):
+  `claude-api`, `claude-subscription`, `openai-compatible`, `codex`,
+  `copilot`, `moonshot`, `gemini`, `minimax`, `nvidia`, `qwen`,
+  `modelscope`. There is no Ollama profile; Ollama is an OpenAI-compatible
+  profile with `base_url` `http://localhost:11434/v1` (`api/registry.py`).
+  Codex calls `https://chatgpt.com/backend-api` (`api/codex_client.py`),
+  Copilot `https://api.githubcopilot.com` (`api/copilot_auth.py`), and the
+  Claude subscription uses the Anthropic client (`api.anthropic.com`). oh
+  reads no environment variable that picks a profile, and a settings file
+  without both `active_profile` and `profiles` falls back to the top-level
+  `provider`/`api_format`/`base_url` keys. `oh_setup.py` now follows these
+  rules (it used to honor an `OPENHARNESS_PROFILE` variable that oh does not
+  read).
+- **Web tools.** `web_fetch` and `web_search` use `trust_env=False`
+  (`utils/network_guard.py`). The package has no `OPENHARNESS_WEB_PROXY`.
+
 ### Needs network / not yet verified
 
-- `pip install mitmproxy openharness-ai`, then run the skipped tests
-  (`python3 -m pytest -q tests -rs` lists them).
-- `python3 harness.py demo --proxy mitm`: HTTPS decryption with the real
-  mitmdump, and that the agent-only CA is trusted by curl, Python `requests`
-  and Node (`NODE_EXTRA_CA_CERTS`).
-- `python3 harness.py oh -- -p "..."` with a real provider: that oh accepts
-  the generated hook settings, that the 403 text reaches the model as the
-  tool error, that `post_tool_use` arrives, and that oh's LLM traffic is row
-  10. Also Ctrl-C and the interactive TUI under the harness.
-- Confirm the row 10 hosts for the Claude and Codex subscriptions and for
-  Copilot.
+- `python3 harness.py oh -- -p "..."` with a real provider. The live test
+  does the basic case: `A10_LIVE_OH=1 python3 -m pytest -q
+  tests/test_harness_oh.py -k Live` asks oh to run `rm demo-files/notes.txt`
+  and checks for the row 28 block. Still to see: how the model reacts to the
+  403 text, that oh's LLM traffic through mitmproxy is row 10 for the
+  detected host, and Ctrl-C and the interactive TUI under the harness.
+- Subscription logins: that the Claude subscription, Codex and Copilot run
+  with the detected hosts, and how the Claude token refresh behaves when
+  `platform.claude.com` is an ask.
 - `python3 harness.py run -- claude` and `-- codex` with real agents.
 - The row 11 subagent test:
   1. Make a scratch workspace:
@@ -498,8 +582,3 @@ the ones that need a real mitmproxy or oh.
   `socket.create_connection(('1.1.1.1', 443), 3)` from the agent container
   must fail, and `curl -s https://example.com` from it must show up in the
   console).
-- Push to [jfjustin/A10-1 on GitHub](https://github.com/jfjustin/A10-1).
-=======
-# A10-1
-A10Hackathon
->>>>>>> ebb9e11bad0f0a52b77172ad8d20c01d20ebbfbe

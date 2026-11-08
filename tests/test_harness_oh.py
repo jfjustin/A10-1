@@ -114,7 +114,8 @@ class HarnessOhTest(unittest.TestCase):
                         FAKE_OH_RECORD=self.record,
                         OPENHARNESS_WEB_PROXY="http://127.0.0.1:9/should-go",
                         A10_OPERATOR_TOKEN="leak-me-not")
-        self.env.pop("OPENHARNESS_PROFILE", None)
+        for k in ("OPENHARNESS_PROFILE", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"):
+            self.env.pop(k, None)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -225,12 +226,17 @@ class HarnessOhTest(unittest.TestCase):
                          ["llm.example.org"])
         self.assertIn("llm.example.org (row 10, from --provider-host)", r.stdout)
 
-    def test_profile_env_override_is_used_for_detection(self):
-        self.env["OPENHARNESS_PROFILE"] = "local"
+    def test_active_profile_from_settings_and_profile_env_ignored(self):
+        settings = dict(USER_SETTINGS, active_profile="local")
+        with open(os.path.join(self.user_dir, "settings.json"), "w") as f:
+            json.dump(settings, f)
+        self.env["OPENHARNESS_PROFILE"] = "codex"  # oh 0.1.9 never reads it
         r = self.run_harness()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.record_json()["status"]["provider_hosts"],
                          ["localhost:11434"])
+        self.assertIn("localhost:11434 (row 10, from oh profile 'local'",
+                      r.stdout)
 
     def test_missing_oh_exits_2_with_install_hint(self):
         empty = os.path.join(self._tmp.name, "empty-bin")

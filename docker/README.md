@@ -102,14 +102,17 @@ Environment variables that `compose.yml` reads from your shell:
 | `A10_PROVIDER_HOST` | `api.anthropic.com` | The row 10 host. It must match the provider oh uses, or the LLM calls become row 9 asks |
 | `A10_DEMO_STUBS` | `0` | `1` makes mitm serve the offline `api.example.com` stubs |
 | `A10_MITMPROXY_TAG` | `11.1.3` | Tag of the `mitmproxy/mitmproxy` image (not checked against Docker Hub) |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENHARNESS_PROFILE` | unset | Passed to the agent only when set in your shell |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | unset | Passed to the agent only when set in your shell |
 
 oh in the container starts without your `~/.openharness`, so it uses its
-default profile (`claude-api`) unless you set `OPENHARNESS_PROFILE` or add
-`active_profile` and `profiles` to `oh-settings.json` (the tests only check
-its `hooks` key). Whether oh picks up `ANTHROPIC_API_KEY` from the
-environment is not verified. Subscription logins (Claude, Codex, Copilot) are
-not set up in this layout.
+default profile (`claude-api`, `api.anthropic.com`). oh 0.1.9 has no
+environment variable that picks a profile; to use another one, mount a
+settings file that holds your `active_profile` and `profiles` as well as the
+hooks, and set `A10_PROVIDER_HOST` to match. The installed openharness 0.1.9 source
+shows that oh reads `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY` for
+OpenAI-format profiles) from the environment; this has not been run in the
+container. Subscription logins (Claude, Codex, Copilot) are not set up in
+this layout.
 
 ## Verify
 

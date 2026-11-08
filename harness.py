@@ -664,6 +664,8 @@ def _run_agent(args, cmd, providers, label, provider_desc, prepare=None,
             return 1
         svc.write_pids()
         env = svc.agent_env(os.environ)
+        # oh 0.1.9 reads no OPENHARNESS_WEB_PROXY; removed in case another
+        # version routes web_fetch through it without our CA.
         env.pop("OPENHARNESS_WEB_PROXY", None)
         if prepare is not None:
             try:
@@ -730,7 +732,7 @@ def cmd_oh(args):
         source = "--provider-host"
     else:
         settings = oh_setup.load_user_settings(user_dir)
-        name, _ = oh_setup.active_profile(settings, os.environ)
+        name, _ = oh_setup.active_profile(settings)
         providers = sorted(oh_setup.provider_hosts(settings, os.environ))
         source = "oh profile '%s' in %s" % (name, user_dir)
     desc = "%s (row 10, from %s)" % (", ".join(providers) or "none", source)

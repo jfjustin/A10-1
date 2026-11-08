@@ -301,6 +301,76 @@ class RealMitmdumpRunTest(RunTestBase):
         self.assertTrue(any(p["source"] == "proxy-mitm" and p["row"] == "20"
                             for p in self.net_events()))
 
+    def test_python_clients_trust_the_agent_ca(self):
+        """REQUESTS_CA_BUNDLE (requests) and SSL_CERT_FILE (urllib's default
+        SSL context, httpx with trust_env, which oh's LLM SDKs use) accept
+        the mitmproxy-signed certificate."""
+        probe = os.path.join(self.base, "clients.py")
+        with open(probe, "w") as f:
+            f.write(CLIENT_PROBE)
+        r = self.run_harness("--proxy", "mitm", "--demo-stubs",
+                             cmd=(sys.executable, probe))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        line = [s for s in r.stdout.splitlines() if s.startswith("{")][-1]
+        got = json.loads(line)
+        for client, text in got.items():
+            if text == "not installed":
+                continue
+            with self.subTest(client):
+                self.assertIn(STUB_TEXT, text)
+        self.assertIn(STUB_TEXT, got["urllib"])
+        hosts = [p["args"].get("host") for p in self.net_events()
+                 if p["source"] == "proxy-mitm" and p["row"] == "8"]
+        self.assertGreaterEqual(hosts.count("api.example.com"),
+                                len([t for t in got.values()
+                                     if t != "not installed"]))
+
+    @unittest.skipUnless(shutil.which("node"), "needs node")
+    def test_node_trusts_the_agent_ca_with_env_proxy(self):
+        """NODE_EXTRA_CA_CERTS with Node's fetch. Node's fetch ignores
+        HTTPS_PROXY unless NODE_USE_ENV_PROXY=1 (Node 24 and later), which the
+        harness does not set; the test sets it to reach the proxy at all."""
+        self.env["PATH"] = os.environ.get("PATH", "")
+        self.env["NODE_USE_ENV_PROXY"] = "1"
+        script = ("fetch('https://api.example.com/status')"
+                  ".then(r => r.text()).then(t => console.log('BODY ' + t))"
+                  ".catch(e => console.log('ERROR ' + (e.cause || e)))")
+        r = self.run_harness("--proxy", "mitm", "--demo-stubs",
+                             cmd=("node", "-e", script))
+        if "BODY" not in r.stdout and "ERR_INVALID_ARG" in r.stdout:
+            self.skipTest("this node does not support NODE_USE_ENV_PROXY")
+        self.assertIn("BODY", r.stdout, r.stdout + r.stderr)
+        self.assertIn(STUB_TEXT, r.stdout)
+
+
+CLIENT_PROBE = '''import json, urllib.request
+url = "https://api.example.com/status"
+out = {}
+try:
+    out["urllib"] = urllib.request.urlopen(url, timeout=20).read().decode()
+except Exception as e:
+    out["urllib"] = "error: %r" % (e,)
+try:
+    import requests
+except ImportError:
+    out["requests"] = "not installed"
+else:
+    try:
+        out["requests"] = requests.get(url, timeout=20).text
+    except Exception as e:
+        out["requests"] = "error: %r" % (e,)
+try:
+    import httpx
+except ImportError:
+    out["httpx"] = "not installed"
+else:
+    try:
+        out["httpx"] = httpx.get(url, timeout=20).text
+    except Exception as e:
+        out["httpx"] = "error: %r" % (e,)
+print(json.dumps(out))
+'''
+
 
 class DemoCommandTest(RunTestBase):
     """`harness.py demo` end to end with piped console input. The operator
@@ -378,6 +448,14 @@ class DemoCommandTest(RunTestBase):
                          FAKE_MITMDUMP.replace("@PYTHON@", sys.executable))
         self.env.update(FAKE_MITM_RECORD=os.path.join(self.base, "mitm.json"),
                         FAKE_CA_PEM=FAKE_PEM)
+        code, out = self.run_demo("--proxy", "mitm")
+        self.assertIn("mitmproxy: HTTPS decrypted", out)
+        self.assert_demo(code, out, "proxy-mitm")
+
+    @unittest.skipUnless(shutil.which("mitmdump"),
+                         "needs the real mitmdump (pip install mitmproxy)")
+    def test_demo_with_real_mitmdump(self):
+        self.env["PATH"] = os.environ.get("PATH", "")
         code, out = self.run_demo("--proxy", "mitm")
         self.assertIn("mitmproxy: HTTPS decrypted", out)
         self.assert_demo(code, out, "proxy-mitm")
