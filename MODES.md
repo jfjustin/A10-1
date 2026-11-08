@@ -266,3 +266,28 @@ in line with the table or stricter; none loosens a verdict.
   `declare +x HTTPS_PROXY`, `typeset +x HTTPS_PROXY`, `readonly HTTPS_PROXY=`
   and `env -i` each strip or empty the proxy variable for child processes, so
   they join `unset` and `env -u` on row 18.
+
+## Review v3 hardening
+
+The v3 pass fixes one regression the v2 ssh option parser introduced and
+extends the ssh inline-code and jump-host handling to the copy senders. Neither
+loosens a verdict.
+
+- **ssh port-forward endpoints are classified.** The v2 parser treated `-L`,
+  `-R` and `-W` as plain value-consuming options and discarded the forward
+  spec, which names a remote host reached through the ssh connection. That let
+  `ssh api.example.com -L 8080:evil.example:80` and
+  `ssh api.example.com -W evil.example:22` tunnel to a non-allowlisted host and
+  be auto-allowed when the ssh server itself was allowlisted. The far-end host
+  in `-L`/`-R` (`[bind:]port:host:hostport`, the field before the last) and in
+  `-W` (`host:port`) now runs through the network rows like a `-J` jump host,
+  so the tunnel is row 20. `-D` (dynamic SOCKS) names no fixed host and adds no
+  row on its own.
+- **The copy senders share ssh's option handling.** `scp` and `sftp` pass
+  `-o` options to ssh, so `-o ProxyCommand=`/`-o LocalCommand=` runs a local
+  command (row 25 plus the inner command) and `-o ProxyJump=`/`-J` names a jump
+  host (row 20), the same as on `ssh`. `rsync -e`/`--rsh` sets the remote-shell
+  command, which runs locally and can carry its own `ssh -J`, so its value is
+  classified as inline code (row 25) and recursed into. A plain local copy
+  (`rsync -az src/ dst/`) or remote copy (`scp a user@host:/x`) is unchanged.
+

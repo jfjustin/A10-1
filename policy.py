@@ -826,17 +826,77 @@ def _handle_git(rest, seg, settings, cwd, matches):
 
 def _bare_sender_host(rest):
     """First bare, non-flag, non-numeric token of a sender command (the host in
-    `nc evil.example 4444` / `ssh evil.example cmd`). Returns None if none."""
+    `telnet evil.example 25` / `sftp evil.example`). Skips option flags and
+    their values so an option value such as `ProxyJump=host` or a batch-file
+    name is never mistaken for the destination. Returns None if none."""
+    skip_next = False
     for tok in rest:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("-o", "-J", "-e", "--rsh", "-b", "-F", "-i", "-l", "-p",
+                   "-P", "-c", "-S"):
+            skip_next = True       # this flag takes the next token as its value
+            continue
         if tok.startswith("-"):
             continue
-        if tok.isdigit():   # a bare port, not a host
+        if "=" in tok:             # an option value (ProxyJump=host), not a host
+            continue
+        if tok.isdigit():          # a bare port, not a host
             continue
         return tok.split("/", 1)[0]
     return None
 
 
+def _sender_options(verb, rest, settings, cwd, matches):
+    """Classify the inline-code and jump-host channels the copy senders share
+    with `ssh`: `-o ProxyCommand=`/`-o LocalCommand=` and `-o ProxyJump=`/`-J`
+    on scp and sftp, and rsync's `-e`/`--rsh` remote-shell command. Each runs a
+    local program before any transfer, so the ssh fix is extended here."""
+    jump = []
+    i, n = 0, len(rest)
+    while i < n:
+        a = rest[i]
+        if verb in ("scp", "sftp") and a.startswith("-o"):
+            val = a[2:] if len(a) > 2 else (rest[i + 1] if i + 1 < n else "")
+            if len(a) == 2:
+                i += 1
+            _ssh_option_kv(val, jump, settings, cwd, matches)
+            i += 1
+            continue
+        if verb in ("scp", "sftp") and a.startswith("-J"):
+            val = a[2:] if len(a) > 2 else (rest[i + 1] if i + 1 < n else "")
+            if len(a) == 2:
+                i += 1
+            jump.extend(h for h in val.replace(" ", "").split(",") if h)
+            i += 1
+            continue
+        if verb == "rsync" and (a == "-e" or a.startswith("-e")
+                                or a == "--rsh" or a.startswith("--rsh=")):
+            if a.startswith("--rsh="):
+                val = a[len("--rsh="):]
+            elif a == "--rsh":
+                val = rest[i + 1] if i + 1 < n else ""
+                i += 1
+            elif len(a) > 2:        # -e'ssh ...'
+                val = a[2:]
+            else:                   # -e ssh ...
+                val = rest[i + 1] if i + 1 < n else ""
+                i += 1
+            if val:
+                matches.append(Match("25", "rsync -e runs a remote-shell command"))
+                _classify_subcommand(val, None, settings, cwd, matches)
+            i += 1
+            continue
+        i += 1
+    for hop in jump:
+        host, port = netcheck.split_host_port(_strip_user(hop).split("/", 1)[0])
+        for m in _net_rows(host, port, "POST", True, [], settings):
+            matches.append(m)
+
+
 def _handle_sender(verb, rest, seg, settings, cwd, matches):
+    _sender_options(verb, rest, settings, cwd, matches)
     hosts = netcheck.hosts_in_args([verb] + rest)
     if not hosts and verb not in _COPY_SENDERS:
         # telnet/ftp/socat/mail take the host as a bare positional argument that
@@ -870,6 +930,28 @@ def _strip_user(token):
     return token.rsplit("@", 1)[-1] if "@" in token else token
 
 
+def _forward_spec_host(ch, val):
+    """Remote host named in an ssh port-forward spec. `-L`/`-R` take
+    `[bind_address:]port:host:hostport`, so the far-end host is the field
+    before the last; `-W` takes `host:port`. `-D` (dynamic SOCKS) names no
+    fixed host. Returns the host, or None when the spec carries none."""
+    val = (val or "").strip()
+    if not val:
+        return None
+    if ch == "W":
+        host, _ = netcheck.split_host_port(val)
+        return host or None
+    # -L / -R : [bind:]port:host:hostport -> the far-end host is the field
+    # before the last. A bracketed IPv6 host keeps its own colons.
+    m = re.search(r"\[([0-9A-Fa-f:]+)\]:\d+$", val)
+    if m:
+        return netcheck.normalize_host(m.group(1))
+    fields = val.split(":")
+    if len(fields) < 3:
+        return None
+    return netcheck.normalize_host(fields[-2]) or None
+
+
 def _ssh_option_kv(val, jump, settings, cwd, matches):
     """Handle an `-o key=value` ssh option."""
     if "=" not in val:
@@ -893,6 +975,7 @@ def _handle_ssh(verb, rest, seg, settings, cwd, matches):
     ProxyJump host or a ProxyCommand anywhere on the line is classified."""
     dest = None
     jump = []
+    forward = []
     i, n = 0, len(rest)
     while i < n:
         a = rest[i]
@@ -918,6 +1001,18 @@ def _handle_ssh(verb, rest, seg, settings, cwd, matches):
                 jump.extend(h for h in val.replace(" ", "").split(",") if h)
                 i += 1
                 continue
+            if ch in ("L", "R", "W"):
+                # Port-forward specs carry a remote host that is contacted
+                # through the ssh connection, the same tunnelling channel as
+                # `-J`. Classify that host, do not discard it with the value.
+                val = a[2:] if len(a) > 2 else (rest[i + 1] if i + 1 < n else "")
+                if len(a) == 2:
+                    i += 1
+                fh = _forward_spec_host(ch, val)
+                if fh:
+                    forward.append(fh)
+                i += 1
+                continue
             if ch in _SSH_VALUE_OPT_CHARS:
                 if len(a) == 2 and i + 1 < n:
                     i += 1    # consume the value token
@@ -934,7 +1029,7 @@ def _handle_ssh(verb, rest, seg, settings, cwd, matches):
         host, port = netcheck.split_host_port(_strip_user(dest).split("/", 1)[0])
         for m in _net_rows(host, port, "POST", True, [], settings):
             matches.append(m)
-    for hop in jump:
+    for hop in jump + forward:
         host, port = netcheck.split_host_port(_strip_user(hop).split("/", 1)[0])
         for m in _net_rows(host, port, "POST", True, [], settings):
             matches.append(m)

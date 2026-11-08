@@ -355,14 +355,30 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
   out. Shell-level outbound channels are caught before this gap applies: a
   `/dev/tcp`/`/dev/udp` redirect in either direction (`> /dev/tcp/...` or
   `exec 3</dev/tcp/...`) is row 20 (row 19 to loopback), a bare-host
-  `nc`/`ssh`/`sftp`/`telnet` is row 20, and an `ssh -J`/`ProxyJump` or
-  `ProxyCommand` on the line is classified too. The remaining gap is a
+  `nc`/`ssh`/`sftp`/`telnet` is row 20, an `ssh -J`/`ProxyJump` jump host, an
+  `ssh -L`/`-R`/`-W` port-forward endpoint, and an `ssh`/`scp`/`sftp`
+  `ProxyCommand` or `rsync -e` remote-shell command on the line are all
+  classified too. The remaining gap is a
   compiled program or a proxy-ignoring client opening its own socket from
   inside a script. The full fix is to run the agent in a Docker network whose
   only exit is the proxy. [docker/README.md](docker/README.md) describes that
   layout (the agent container on an internal network, mitmproxy as its only
   exit) and lists the commands that check it. It is **unverified**: it was
   written on 2026-11-07 without Docker or network, so none of it has run.
+- **Path matching keys off the agent's own home.** The credential, secret and
+  persistence checks resolve `~`, `$HOME` and `$PWD` against the harness's
+  configured home, so `cat ~/.ssh/id_rsa` and `cat $HOME/.ssh/id_rsa` are row
+  16. A `~otheruser` path (`cat ~root/.ssh/id_rsa`) resolves through the system
+  passwd database to a home outside that model, so it is read-only (row 5), not
+  row 16. This needs read access to another user's home, which the agent does
+  not have. A glob that still carries `*?[` after expansion is matched against a
+  fixed list of representative credential and persistence files (`~/.ssh/*`,
+  `~/.aws/credentials`, `~/.config/gh/*`, the login shell files, `~/Library/
+  LaunchAgents`); a glob aimed at a credential file not on that list
+  (`~/.config/*/credentials`) falls back to its literal directory prefix and can
+  read through. The glob is never weaker than the matching literal path. Keep
+  the probe list in `policy._sensitive_probe_paths` in step with
+  `is_credential_path` as new credential locations are added.
 - **oh's `web_fetch` and `web_search` ignore the proxy.** oh 0.1.9 creates
   their HTTP client with `trust_env=False` (`openharness/utils/network_guard.py`),
   so they skip `*_PROXY` and the CA variables. The gateway still judges them
@@ -415,8 +431,8 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
 
 Run on macOS with Python 3.11.11, mitmproxy 11.0.2, openharness-ai 0.1.9
 and Node 25.1 installed, and no network:
-`python3 -m unittest discover -s tests -v`: 267 tests, OK (skipped=1).
-`python3 -m pytest -q tests -rs`: 266 passed, 1 skipped, 195 subtests passed
+`python3 -m unittest discover -s tests -v`: 277 tests, OK (skipped=1).
+`python3 -m pytest -q tests -rs`: 276 passed, 1 skipped, 204 subtests passed
 (about 29 s). The one skip is the live oh test (`LiveOhTest`), which needs a
 configured provider, network and `A10_LIVE_OH=1`. On a machine without
 mitmproxy, openharness or node, the tests that need them skip too.
@@ -441,7 +457,13 @@ mitmproxy, openharness or node, the tests that need them skip too.
   (row 20), `ProxyCommand` and `nc -e` (row 25), and `ssh -l user` not
   mistaken for the host; octal/zero-padded/decimal/hex loopback and the
   metadata IP encodings (row 19); and `export -n`/`declare +x`/`typeset +x`/
-  `readonly PROXY=`/`env -i` as row 18.
+  `readonly PROXY=`/`env -i` as row 18. The review v3 cases (`ReviewV3Test`):
+  an `ssh -L`/`-R`/`-W` port-forward to a non-allowlisted host is row 20 even
+  when the ssh server is allowlisted, a forward to an allowlisted host is not,
+  `-D` dynamic forwarding names no host; and `scp`/`sftp -o ProxyCommand=`
+  (row 25 plus the inner command), `scp -o ProxyJump=`/`-J` (row 20) and
+  `rsync -e 'ssh -J ...'` (row 25 plus row 20) match the `ssh` handling, while
+  a plain local or remote copy is unchanged.
 - `tests/test_gateway.py`, `tests/test_audit.py`: hook allow, block and held
   ask; approve, deny with reason, approve-for-run; expiry fails closed; 401
   on control endpoints without the right token; `/mode`, `/override` (only

