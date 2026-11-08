@@ -461,7 +461,10 @@ class RealMitmproxyTest(unittest.TestCase):
 
         async def go():
             with taddons.context() as tctx:
-                addon = tctx.script(os.path.join(ROOT, "mitm_addon.py"))
+                module = tctx.script(os.path.join(ROOT, "mitm_addon.py"))
+                # mitmdump registers the module's `addons`; the hooks live on
+                # the A10Gate instance, not the module, so drive that instance.
+                addon = module.addons[0]
                 addon.ask = FakeAsk(BLOCK_20)
                 f = tflow.tflow()
                 f.request.method = "POST"

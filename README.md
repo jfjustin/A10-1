@@ -351,8 +351,13 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
   not what the script does. The script can open sockets or read files such as
   `~/.ssh` without any tool call. The proxy only sees traffic from programs
   that honor the `*_PROXY` environment variables; anything else goes straight
-  out. The full fix is to run the agent in a Docker network whose only exit is
-  the proxy. [docker/README.md](docker/README.md) describes that layout (the
+  out. Shell-level outbound channels are caught before this gap applies: a
+  `/dev/tcp`/`/dev/udp` redirect is row 20 (row 19 to loopback) and a
+  bare-host `nc`/`ssh`/`telnet` is row 20, so a command line cannot open a
+  socket the table misses. The remaining gap is a compiled program or a
+  proxy-ignoring client opening its own socket. The full fix is to run the
+  agent in a Docker network whose only exit is the proxy.
+  [docker/README.md](docker/README.md) describes that layout (the
   agent container on an internal network, mitmproxy as its only exit) and
   lists the commands that check it. It is **unverified**: it was written on
   2026-11-07 without Docker or network, so none of it has run.
@@ -391,17 +396,22 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
 
 ### Verified offline on 2026-11-07
 
-`python3 -m unittest discover -s tests -v`: 211 tests, OK, 4 skipped.
-`python3 -m pytest -q tests`: 207 passed, 4 skipped, 81 subtests passed
-(about 20 s). The skipped tests are the ones that need the real mitmproxy or
-oh.
+`python3 -m unittest discover -s tests -v`: 223 tests, OK. `python3 -m pytest
+-q tests`: 222 passed, 111 subtests passed (about 23 s). Between one and four
+tests skip depending on whether `mitmproxy` and `oh` are importable; they are
+the ones that need a real mitmproxy or oh.
 
 - `tests/test_policy.py`, `tests/test_shellparse.py`: the row table matches
   the approved table cell by cell; at least one example per row in all three
   modes; the tricky shell cases (`ls; rm`, `$(rm x)`, quote tricks,
   `bash -c`, pipe-to-shell, `base64 -d | sh`, redirects, heredocs); clean-URL
   and taint rules with a fake clock; precedence, overrides with `YES` only,
-  approve-for-run, 30 s network passes; harness self-protection.
+  approve-for-run, 30 s network passes; harness self-protection. The review
+  v1 hardening cases: bare-host senders (`nc`/`ssh`/`telnet host ...` are row
+  20, not row 6), `/dev/tcp`/`/dev/udp` redirect channels (row 20, or row 19
+  to loopback), a standalone `HTTPS_PROXY=` segment (row 18), loopback
+  spellings `127.1`/`0x7f000001`/`::ffff:127.0.0.1`/`*.localhost` (row 19),
+  and `command -v rm` as read-only (row 5, not a row 28 block).
 - `tests/test_gateway.py`, `tests/test_audit.py`: hook allow, block and held
   ask; approve, deny with reason, approve-for-run; expiry fails closed; 401
   on control endpoints without the right token; `/mode`, `/override` (only
