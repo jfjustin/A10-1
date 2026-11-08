@@ -1,0 +1,164 @@
+# Docker layout for the row 6 gap: the agent container's only network exit
+# is mitmproxy, so scripts it runs (`python x.py`) cannot open their own
+# connections around the proxy.
+#
+# UNVERIFIED: written on 2026-11-07 without Docker or network. Nothing in this
+# file has been run. docker/README.md lists the commands that check it.
+#
+#   export A10_HOME="$HOME/.a10-harness"
+#   python3 -c 'import harness; harness.ensure_operator_token(harness.a10_home())'
+#   docker compose -f docker/compose.yml up --build -d gateway mitm
+#   python3 harness.py watch                          # operator console
+#   docker compose -f docker/compose.yml run --rm agent
+#
+# Networks:
+#   agentnet  internal: no route out of Docker. agent, mitm and gateway.
+#   egress    normal bridge. mitm (upstream traffic) and gateway (only so the
+#             published console port works; the gateway makes no outbound
+#             calls).
+
+name: a10-harness
+
+services:
+  gateway:
+    image: python:3.11-slim
+    working_dir: /harness
+    command:
+      - python3
+      - /harness/gateway.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --allow-host-header
+      - gateway:8000
+      - --workspace
+      - /workspace
+      - --cwd
+      - /workspace
+      - --audit-log
+      - /data/audit.log.jsonl
+      - --mode
+      - ${A10_MODE:-default}
+      - --provider-host
+      - ${A10_PROVIDER_HOST:-api.anthropic.com}
+    environment:
+      A10_HOME: /a10
+      # The policy expands ~ with HOME; use the agent's home so ~/.ssh,
+      # ~/.zshrc and friends mean the same paths the agent sees.
+      HOME: /home/agent
+      A10_DEMO_STUBS: ${A10_DEMO_STUBS:-0}
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ..:/harness:ro
+      - ${A10_WORKSPACE:-../demo-files}:/workspace:ro
+      - type: bind
+        source: "${A10_HOME:?set A10_HOME first, see docker/README.md}/operator.token"
+        target: /a10/operator.token
+        read_only: true
+        bind:
+          create_host_path: false
+      - a10-audit:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - agentnet
+      - egress
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/status', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  mitm:
+    image: mitmproxy/mitmproxy:${A10_MITMPROXY_TAG:-11.1.3}
+    init: true
+    # mitmdump with the harness addon. The CA (key and cert) stays in the
+    # mitm-conf volume; only the public cert is copied to mitm-ca, which the
+    # agent mounts read-only.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        (until [ -s /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem ]; do sleep 1; done;
+        cp /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem /ca/ca-cert.tmp &&
+        mv /ca/ca-cert.tmp /ca/mitmproxy-ca-cert.pem) &
+        exec mitmdump --listen-host 0.0.0.0 --listen-port 8080
+        --set confdir=/home/mitmproxy/.mitmproxy
+        --set connection_strategy=lazy
+        -q -s /harness/mitm_addon.py
+    environment:
+      A10_GATEWAY_URL: http://gateway:8000
+      A10_DEMO_STUBS: ${A10_DEMO_STUBS:-0}
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ..:/harness:ro
+      - mitm-conf:/home/mitmproxy/.mitmproxy
+      - mitm-ca:/ca
+    networks:
+      - agentnet
+      - egress
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-s", "/ca/mitmproxy-ca-cert.pem"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    # Interactive oh: `docker compose -f docker/compose.yml run --rm agent`.
+    stdin_open: true
+    tty: true
+    networks:
+      - agentnet
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      HTTP_PROXY: http://mitm:8080
+      HTTPS_PROXY: http://mitm:8080
+      http_proxy: http://mitm:8080
+      https_proxy: http://mitm:8080
+      NO_PROXY: gateway,localhost,127.0.0.1
+      no_proxy: gateway,localhost,127.0.0.1
+      # Every TLS connection the agent makes ends at mitm, so the mitm CA is
+      # the only certificate it needs to trust.
+      SSL_CERT_FILE: /a10/mitm-ca/mitmproxy-ca-cert.pem
+      REQUESTS_CA_BUNDLE: /a10/mitm-ca/mitmproxy-ca-cert.pem
+      CURL_CA_BUNDLE: /a10/mitm-ca/mitmproxy-ca-cert.pem
+      NODE_EXTRA_CA_CERTS: /a10/mitm-ca/mitmproxy-ca-cert.pem
+      OPENHARNESS_CONFIG_DIR: /a10/oh-config
+      # Passed through from your shell only when set there.
+      OPENHARNESS_PROFILE:
+      ANTHROPIC_API_KEY:
+      OPENAI_API_KEY:
+    volumes:
+      - ${A10_WORKSPACE:-../demo-files}:/workspace
+      - ./oh-settings.json:/a10/oh-config/settings.json:ro
+      - mitm-ca:/a10/mitm-ca:ro
+    depends_on:
+      gateway:
+        condition: service_healthy
+      mitm:
+        condition: service_healthy
+
+networks:
+  agentnet:
+    internal: true
+  egress:
+    driver: bridge
+
+volumes:
+  a10-audit:
+  mitm-conf:
+  mitm-ca:

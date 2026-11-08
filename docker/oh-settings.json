@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "pre_tool_use": [
+      {
+        "type": "http",
+        "url": "http://gateway:8000/hooks/oh",
+        "timeout_seconds": 600,
+        "block_on_failure": true,
+        "priority": 1000
+      }
+    ],
+    "post_tool_use": [
+      {
+        "type": "http",
+        "url": "http://gateway:8000/hooks/oh",
+        "timeout_seconds": 10,
+        "block_on_failure": false,
+        "priority": 1000
+      }
+    ]
+  }
+}

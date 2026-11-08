@@ -331,8 +331,9 @@ additions are in [MODES.md](MODES.md).
 | `console.py` | Terminal operator console |
 | `proxy.py` | Stdlib proxy (fallback, no HTTPS decryption) |
 | `mitm_addon.py` | mitmproxy addon; the only file that imports mitmproxy |
-| `oh_setup.py` | oh config directory with the gateway hooks; provider host detection |
+| `oh_setup.py` | oh config directory with the gateway hooks; provider host detection; `--print-hooks` generates `docker/oh-settings.json` |
 | `agent.py` | Scripted offline demo agent that speaks oh's hook format |
+| `docker/` | Unverified Docker layout for the row 6 gap: `compose.yml`, `Dockerfile.agent`, `oh-settings.json`, `README.md` |
 | `demo-files/notes.txt` | The file the planted `rm` tries to delete |
 | `MODES.md` | Mode table, precedence, settings |
 | `PITCH_AND_DEVPOST.md` | 60-second pitch and DevPost notes |
@@ -350,8 +351,10 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
   `~/.ssh` without any tool call. The proxy only sees traffic from programs
   that honor the `*_PROXY` environment variables; anything else goes straight
   out. The full fix is to run the agent in a Docker network whose only exit is
-  the proxy. That layout is planned but not built or tested yet (Docker was
-  not available on the build machine).
+  the proxy. [docker/README.md](docker/README.md) describes that layout (the
+  agent container on an internal network, mitmproxy as its only exit) and
+  lists the commands that check it. It is **unverified**: it was written on
+  2026-11-07 without Docker or network, so none of it has run.
 - **oh's `web_fetch` and `web_search` ignore the proxy.** oh creates their
   HTTP client with `trust_env=False`, so they skip `*_PROXY` and the CA
   variables. The gateway still judges them at the tool level (URL, host,
@@ -387,8 +390,8 @@ Runtime files: `audit.log.jsonl` and `demo-files/summary.md` in the repo
 
 ### Verified offline on 2026-11-07
 
-`python3 -m unittest discover -s tests -v`: 188 tests, OK, 4 skipped.
-`python3 -m pytest -q tests`: 184 passed, 4 skipped, 81 subtests passed
+`python3 -m unittest discover -s tests -v`: 211 tests, OK, 4 skipped.
+`python3 -m pytest -q tests`: 207 passed, 4 skipped, 81 subtests passed
 (about 20 s). The skipped tests are the ones that need the real mitmproxy or
 oh.
 
@@ -432,6 +435,14 @@ oh.
   proxy (stub allowed as row 8, exfiltration 403 as row 20); `--proxy mitm`
   lifecycle and agent-only CA variables with a fake `mitmdump`; `harness.py
   demo` with piped console input.
+- `tests/test_docker_layout.py`: static text checks of `docker/` only (no
+  Docker, no PyYAML): the agent service is on the internal `agentnet` only,
+  with no operator token, `docker.sock` or harness code mounted; the console
+  port is published on 127.0.0.1 only; the gateway command uses real
+  `gateway.py` flags and the gateway accepts the `gateway:8000` Host header;
+  the mitmdump command matches the harness's; `docker/oh-settings.json` is
+  what `oh_setup.py --print-hooks` prints. This does not verify that Docker
+  behaves as described; the layout itself is still unverified.
 - Manual runs of `python3 harness.py demo` with piped console input (approve
   the write with `a`, then `s`), with a temporary `A10_HOME`: the console
   showed the allow, ask and block lines from "Demo beats", the agent printed
@@ -470,5 +481,10 @@ oh.
      go through the gateway: flip row 11 to ⛔/❓/✅ in `policy.ROWS` and in
      MODES.md. If the `rm` never appears or the file is gone, keep row 11 ⛔
      in every mode.
-- The Docker layout for the row 6 gap (planned, not built or tested).
+- The Docker layout for the row 6 gap
+  ([docker/README.md](docker/README.md), unverified): build it, then run the
+  ten checks in its "Verify" section (for example, a direct
+  `socket.create_connection(('1.1.1.1', 443), 3)` from the agent container
+  must fail, and `curl -s https://example.com` from it must show up in the
+  console).
 - Push to [jfjustin/A10-1 on GitHub](https://github.com/jfjustin/A10-1).

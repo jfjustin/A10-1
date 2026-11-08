@@ -117,8 +117,9 @@ Some notes on specific rows:
   (`python x.py`) can open sockets or read files without making a tool call,
   and mitmproxy only sees traffic from programs that honor the `*_PROXY`
   environment variables. The full fix is to run the agent in a Docker network
-  whose only exit is the proxy. That layout is planned and has not been built
-  or tested yet.
+  whose only exit is the proxy. [docker/README.md](docker/README.md) describes
+  that layout. It is unverified: it was written without Docker or network and
+  has not been run.
 - **Row 9 in auto** allows a GET to an unknown host only when the URL is clean
   and the run is not tainted (see `clean_url` and `taint_tracking` below).
   Anything else is ❓. A GET can carry data out in its URL

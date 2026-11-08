@@ -70,7 +70,8 @@ planted `rm` becomes an ask you could approve by mistake.
 - "What can't it catch?" A script the agent runs can open sockets or read
   files without a tool call, and the proxy only sees programs that honor
   `*_PROXY`. The fix is a Docker network whose only exit is the proxy;
-  planned, not built yet. The README lists every known gap.
+  docker/README.md has that layout, written but not run yet (unverified).
+  The README lists every known gap.
 - "Can the agent turn the harness off?" Editing the policy, hooks or audit
   log, unsetting `*_PROXY`, killing the gateway or proxy and adding CA certs
   are all row 18 (⛔). The control endpoints need an operator token the agent
@@ -126,14 +127,15 @@ Judging criteria (from the DevPost page) and what to lean on:
   `console.py` (terminal operator console), `proxy.py` (no-install proxy),
   `audit.py` (hash chain). `mitm_addon.py` plugs into mitmproxy and
   `oh_setup.py` points OpenHarness's `pre_tool_use` HTTP hook at the gateway.
-  188 offline tests (unittest, also run under pytest).
+  211 offline tests (unittest, also run under pytest).
 - **Challenges:** Making the block happen *before* execution, not after;
   shell commands that hide `rm` behind `;`, `$()` or quotes; GETs that carry
   secrets in the URL; trusting the mitmproxy CA in the agent only, without
   touching the keychain; keeping the demo visual in 60 seconds.
-- **What's next:** Docker network whose only exit is the proxy (closes the
-  row 6 gap); live runs with real providers to confirm the subscription and
-  Copilot hosts; the row 11 subagent test; per-agent policies.
+- **What's next:** run and verify the Docker layout in `docker/` (written,
+  not yet run) whose only exit is the proxy, closing the row 6 gap; live runs
+  with real providers to confirm the subscription and Copilot hosts; the row
+  11 subagent test; per-agent policies.
 - **Built with:** Python (stdlib core), mitmproxy, OpenHarness (oh).
   **Track:** A10, Prompt 2: Agent Harness. **Scope:** CLI agents only.
 

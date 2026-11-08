@@ -1,0 +1,27 @@
+# Agent image for docker/compose.yml: OpenHarness (`oh`) running on the
+# internal network `agentnet`, whose only exit is the mitm service.
+#
+# UNVERIFIED: written on 2026-11-07 without Docker or network. See
+# docker/README.md for the commands that check it.
+#
+# The build itself has normal network access (apt, pip). The running
+# container does not: compose attaches it to agentnet only.
+FROM python:3.11-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir openharness-ai
+
+# Non-root user. /a10/oh-config is OPENHARNESS_CONFIG_DIR (compose mounts the
+# gateway hook settings into it read-only); /a10/mitm-ca receives the mitm CA
+# certificate (public part only) from a read-only volume.
+RUN useradd --create-home --uid 1000 --shell /bin/bash agent \
+    && mkdir -p /workspace /a10/oh-config /a10/mitm-ca \
+    && chown agent:agent /workspace /a10/oh-config \
+    && chmod 0700 /a10/oh-config
+
+USER agent
+WORKDIR /workspace
+ENTRYPOINT ["oh", "--permission-mode", "full_auto"]

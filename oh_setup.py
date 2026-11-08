@@ -14,6 +14,10 @@ the user's own oh configuration:
   provider_hosts()      the LLM provider host of oh's active profile, which
                         the policy allows as row 10 (and nothing else).
 
+CLI (generates docker/oh-settings.json for the Docker layout):
+  python3 oh_setup.py --print-hooks --gateway-url http://gateway:8000 \\
+      > docker/oh-settings.json
+
 Facts about oh this relies on (read from github.com/HKUDS/OpenHarness): oh
 loads settings only from $OPENHARNESS_CONFIG_DIR/settings.json (default
 ~/.openharness/settings.json); an http hook POSTs {"event", "payload"} and,
@@ -22,8 +26,10 @@ becomes the tool error; the hook timeout is capped at 600 s.
 
 Stdlib only.
 """
+import argparse
 import json
 import os
+import sys
 from urllib.parse import urlsplit
 
 DEFAULT_PROFILE = "claude-api"
@@ -244,3 +250,28 @@ def prepare_config_dir(a10_home, gateway_url, user_dir=None, env=None):
                    json.dumps(settings, indent=2) + "\n")
     _sync_links(user_dir, out_dir)
     return {"OPENHARNESS_CONFIG_DIR": out_dir}
+
+
+def hooks_json(gateway_url):
+    """settings.json text holding only the gateway's hooks."""
+    return json.dumps({"hooks": hook_settings(gateway_url)}, indent=2) + "\n"
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        description="Print oh settings.json with the A10 gateway hooks")
+    p.add_argument("--print-hooks", action="store_true",
+                   help='print {"hooks": ...} as JSON on stdout')
+    p.add_argument("--gateway-url", default="http://127.0.0.1:8000",
+                   help="gateway base URL the hooks call (default %(default)s)")
+    args = p.parse_args(argv)
+    if not args.print_hooks:
+        p.print_usage(sys.stderr)
+        print("nothing to do: pass --print-hooks", file=sys.stderr)
+        return 2
+    sys.stdout.write(hooks_json(args.gateway_url))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
