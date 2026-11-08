@@ -5,3 +5,4 @@ audit.log.jsonl
 audit*.jsonl
 demo-files/summary.md
 .DS_Store
+audit.log.jsonl
