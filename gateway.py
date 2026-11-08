@@ -26,6 +26,9 @@ Endpoints (bound to 127.0.0.1; requests with a foreign Host header are refused):
   POST /tool-call        {tool, args, agent}: 200 allow, 403 block/deny/expired,
                          503 stopped
   POST /net/judge        proxy judgement: 200 {"verdict": "allow"} or 403
+  POST /net/note         informational proxy event {source, host, message}
+                         (e.g. TLS interception failed); verdict "info",
+                         never changes state; capped and rate-limited (429)
   Operator only (header X-A10-Operator-Token, else 401):
   POST /approve          {id, decision: approve|approve_run|deny, reason?}
   POST /stop             stop the run, deny everything still pending
@@ -58,6 +61,10 @@ MAX_EVENTS = 5000
 TRUNCATE_AT = 500
 JUDGED_KINDS = ("tool", "net", "decision")
 COUNT_KEYS = ("allow", "ask", "approved", "block", "deny", "expired", "stopped")
+PROXY_SOURCES = ("proxy-mitm", "proxy-stdlib")
+NOTE_MAX_LEN = 300       # chars kept from an informational proxy note
+NOTE_LIMIT = 30          # notes accepted per NOTE_WINDOW seconds
+NOTE_WINDOW = 60.0
 
 
 def a10_home(environ=None):
@@ -198,6 +205,7 @@ class GatewayApp:
             pids_file = os.path.join(settings.a10_home, "run", "pids.json")
         self.pids_file = pids_file
         self._pids_mtime = None
+        self._note_times = []
         self.state = policy.RunState(run_id=_new_run_id(), mode=mode)
         with self.lock:
             self.audit.append("run_start", self._run_info())
@@ -338,6 +346,22 @@ class GatewayApp:
                 self._emit("taint", "taint", "taint", reason=reason,
                            source=source, tool=tool)
             return hits
+
+    def note(self, source, host, message):
+        """Informational proxy event (verdict "info"). Never changes run
+        state. Returns False when rate-limited (NOTE_LIMIT per NOTE_WINDOW)."""
+        msg = _scrub_text(str(message or ""))[:NOTE_MAX_LEN]
+        host = netcheck.normalize_host(str(host or ""))[:255]
+        with self.lock:
+            now = time.time()
+            self._note_times = [t for t in self._note_times
+                                if now - t < NOTE_WINDOW]
+            if len(self._note_times) >= NOTE_LIMIT:
+                return False
+            self._note_times.append(now)
+            self._emit("note", "net_note", "info", reason=msg, source=source,
+                       tool="net", args={"host": host})
+            return True
 
     # -- operator actions --------------------------------------------------
 
@@ -786,6 +810,8 @@ class Handler(BaseHTTPRequestHandler):
             self._tool_call(data)
         elif path == "/net/judge":
             self._net_judge(data)
+        elif path == "/net/note":
+            self._net_note(data)
         elif path in ("/approve", "/stop", "/mode", "/override", "/reset"):
             if not self._operator_ok():
                 self._json({"error": "operator token required "
@@ -840,7 +866,7 @@ class Handler(BaseHTTPRequestHandler):
     def _net_judge(self, data):
         app = self.app
         source = data.get("source")
-        if source not in ("proxy-mitm", "proxy-stdlib"):
+        if source not in PROXY_SOURCES:
             source = "proxy-stdlib"
         url = str(data.get("url") or "")
         host = netcheck.normalize_host(str(data.get("host") or ""))
@@ -877,6 +903,15 @@ class Handler(BaseHTTPRequestHandler):
             body = res.as_json()
             body["reason"] = res.text(app.approval_wait)
             self._json(body, 403, verdict=res.verdict)
+
+    def _net_note(self, data):
+        source = data.get("source")
+        if source not in PROXY_SOURCES:
+            source = "proxy-stdlib"
+        if self.app.note(source, data.get("host"), data.get("message")):
+            self._json({"ok": True})
+        else:
+            self._json({"ok": False, "error": "rate limited"}, 429)
 
     def _operator(self, path, data):
         app = self.app

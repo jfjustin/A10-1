@@ -45,14 +45,14 @@ _PID_RE = re.compile(r"^p\d+$")
 
 GLYPH = {"allow": "✅", "approved": "✅", "ask": "❓", "block": "⛔",
          "deny": "🚫", "expired": "⌛", "stopped": "■", "taint": "⚠",
-         "mode": "⚙", "override": "⚠", "reset": "↺"}
+         "mode": "⚙", "override": "⚠", "reset": "↺", "info": "ℹ"}
 LABEL = {"allow": "ALLOW", "approved": "APPROVED", "ask": "ASK",
          "block": "BLOCK", "deny": "DENIED", "expired": "EXPIRED",
          "stopped": "STOPPED", "taint": "TAINTED", "mode": "MODE",
-         "override": "OVERRIDE", "reset": "RESET"}
+         "override": "OVERRIDE", "reset": "RESET", "info": "INFO"}
 COLOR = {"allow": "32", "approved": "32", "ask": "33;1", "block": "31;1",
          "deny": "31;1", "expired": "31", "stopped": "31;1", "taint": "35",
-         "mode": "36", "override": "35;1", "reset": "36"}
+         "mode": "36", "override": "35;1", "reset": "36", "info": "36"}
 
 HELP = """Commands (press Enter after each):
   a [id]           approve once          A [id]   approve for the rest of the run

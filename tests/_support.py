@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -23,6 +24,29 @@ import gateway  # noqa: E402
 import proxy  # noqa: E402
 
 TOKEN = "test-operator-token-0123456789"
+HARNESS = os.path.join(ROOT, "harness.py")
+
+
+def free_port():
+    """An ephemeral port that is free right now (for harness subprocesses,
+    which need the port number up front)."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def write_executable(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+    os.chmod(path, 0o755)
+    return path
+
+
+def read_audit(path):
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
 class Response:
